@@ -18,6 +18,8 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 1;
 const WORKSPACE_SECTION_FOOTER_ROWS: u16 = 3;
+pub(super) const SECTION_HEADER_ROWS: u16 = WORKSPACE_SECTION_HEADER_ROWS;
+pub(super) const SECTION_FOOTER_ROWS: u16 = WORKSPACE_SECTION_FOOTER_ROWS;
 /// Fixed content rows per agent list entry: pane name, then status. Entries
 /// whose agent reports what it is doing add wrapped status text rows below
 /// these. The folder the agent works in is not counted here: it sits above the
@@ -698,7 +700,8 @@ pub(crate) fn workspace_list_body_rect(app: &AppState, area: Rect, has_scrollbar
         WORKSPACE_SECTION_FOOTER_ROWS
     };
     let body_y = area.y.saturating_add(WORKSPACE_SECTION_HEADER_ROWS);
-    let footer_y = area.y + area.height.saturating_sub(footer_rows);
+    let reserved = footer_rows + super::usage_bar::sidebar_rows(app, area.height);
+    let footer_y = area.y + area.height.saturating_sub(reserved);
     let body_height = footer_y.saturating_sub(body_y);
     let body_width = area.width.saturating_sub(u16::from(has_scrollbar));
     Rect::new(area.x, body_y, body_width, body_height)
@@ -937,12 +940,17 @@ fn new_workspace_button_rect_below(
     list_bottom: u16,
     list_scrolls: bool,
 ) -> Rect {
-    if spaces_section_collapsed(app) || ws_area.height < WORKSPACE_SECTION_FOOTER_ROWS {
+    let usage_rows = super::usage_bar::sidebar_rows(app, ws_area.height);
+    if spaces_section_collapsed(app) || ws_area.height < WORKSPACE_SECTION_FOOTER_ROWS + usage_rows
+    {
         return Rect::default();
     }
     // A gap row keeps the button off the last entry and leaves room for the
     // reorder drop indicator.
-    let floor = ws_area.y + ws_area.height.saturating_sub(WORKSPACE_SECTION_FOOTER_ROWS);
+    let floor = ws_area.y
+        + ws_area
+            .height
+            .saturating_sub(WORKSPACE_SECTION_FOOTER_ROWS + usage_rows);
     let y = if list_scrolls {
         floor
     } else {
@@ -1179,6 +1187,7 @@ pub(crate) fn render_sidebar(
     );
 
     render_workspace_rows(app, terminal_runtimes, frame, area);
+    super::usage_bar::render_sidebar_block(app, frame, area);
 }
 
 fn fill_sidebar_background(app: &AppState, frame: &mut Frame, area: Rect) {

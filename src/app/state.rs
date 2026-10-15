@@ -1916,6 +1916,9 @@ pub struct AppState {
     /// full table, freeing height for tabs and panes.
     pub agent_table_collapsed: bool,
     pub spaces_collapsed: bool,
+    /// `herdr view usage hide`: every allowance display is off at once, over
+    /// whatever the config switches say. Saved with the session.
+    pub usage_hidden: bool,
     /// Legacy ratio of sidebar height once allocated to the workspaces
     /// section. Kept so older sessions still restore.
     pub sidebar_section_split: f32,
@@ -1979,6 +1982,13 @@ pub struct AppState {
     pub nerd_font: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub pane_header: PaneHeaderConfig,
+    /// The sidebar allowance block and the 10% alert.
+    pub usage_config: crate::config::UsageDisplayConfig,
+    /// The latest allowance readings, drawn in pane headers and the sidebar.
+    pub usage_snapshot: Option<crate::usage::UsageSnapshot>,
+    /// Epoch seconds the countdowns are worked from. Set once per frame by
+    /// `compute_view`, so drawing reads no clock.
+    pub usage_now: u64,
     pub pane_history_persistence: bool,
     /// Refresh Summary asks a headless `grok -p` session for a 5–8 word
     /// headline. Off, it reads the latest prompt from the session log.
@@ -2387,6 +2397,7 @@ impl AppState {
             sidebar_collapsed: false,
             agent_table_collapsed: false,
             spaces_collapsed: false,
+            usage_hidden: false,
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             agent_table_scroll: 0,
@@ -2429,6 +2440,9 @@ impl AppState {
             nerd_font: false,
             show_agent_labels_on_pane_borders: true,
             pane_header: PaneHeaderConfig::default(),
+            usage_config: crate::config::UsageDisplayConfig::default(),
+            usage_snapshot: None,
+            usage_now: 0,
             pane_history_persistence: false,
             refresh_summary_with_grok: false,
             hide_attached_agents: false,
