@@ -422,6 +422,7 @@ fn restore_workspace(
                 .clone()
                 .unwrap_or_else(crate::workspace::generate_workspace_id),
             custom_name: snap.custom_name.clone(),
+            purpose: snap.purpose.clone(),
             identity_cwd: snap.identity_cwd.clone(),
             cached_git_branch: crate::workspace::git_branch(&snap.identity_cwd),
             cached_git_ahead_behind: None,
@@ -578,6 +579,8 @@ fn restore_tab(
         Some((
             crate::workspace::Tab {
                 custom_name: snap.custom_name.clone(),
+                goal: snap.goal.clone(),
+                layout_preview_hidden: snap.layout_preview_hidden,
                 number,
                 root_pane,
                 layout,
@@ -641,6 +644,7 @@ fn restore_pane(
     let saved_label = saved_pane.and_then(|p| p.label.clone());
     let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
     let saved_title_name = saved_pane.and_then(|p| p.title_name.clone());
+    let saved_summary = saved_pane.and_then(|p| p.summary.clone());
     let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
     let saved_agent_timing = saved_pane.and_then(|p| p.agent_timing.as_ref());
     let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
@@ -685,6 +689,9 @@ fn restore_pane(
         }
         if let Some(title_name) = saved_title_name {
             terminal.title_name = Some(title_name);
+        }
+        if let Some(summary) = saved_summary {
+            terminal.set_session_title(Some(summary));
         }
         if let Some(timing) = saved_agent_timing {
             timing.restore_into(&mut terminal);
@@ -796,6 +803,9 @@ fn restore_pane(
             }
             if let Some(title_name) = saved_title_name {
                 terminal.title_name = Some(title_name);
+            }
+            if let Some(summary) = saved_summary {
+                terminal.set_session_title(Some(summary));
             }
             if let Some(timing) = saved_agent_timing {
                 timing.restore_into(&mut terminal);
@@ -1313,6 +1323,7 @@ mod tests {
                     completed: false,
                     agent_timing: None,
                     title_name: None,
+                    summary: None,
                 },
                 seen: false,
                 completed: true,
@@ -1376,6 +1387,7 @@ mod tests {
                     completed: false,
                     agent_timing: None,
                     title_name: None,
+                    summary: None,
                 },
                 seen: true,
                 completed: false,
@@ -1420,11 +1432,14 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(7),
                     panes: HashMap::from([(
@@ -1440,6 +1455,7 @@ mod tests {
                             completed: false,
                             agent_timing: None,
                             title_name: None,
+                            summary: None,
                         },
                     )]),
                     zoomed: false,
@@ -1507,16 +1523,20 @@ mod tests {
                 completed,
                 agent_timing: None,
                 title_name: None,
+                summary: None,
             }
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
@@ -1610,12 +1630,15 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 agent_order: Vec::new(),
                 tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1636,6 +1659,7 @@ mod tests {
                             completed: false,
                             agent_timing: None,
                             title_name: None,
+                            summary: None,
                         },
                     )]),
                     zoomed: false,
@@ -1691,12 +1715,15 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 agent_order: Vec::new(),
                 tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
@@ -1717,6 +1744,7 @@ mod tests {
                             completed: false,
                             agent_timing: None,
                             title_name: None,
+                            summary: None,
                         },
                     )]),
                     zoomed: false,
@@ -1885,6 +1913,7 @@ mod tests {
                 completed: false,
                 agent_timing: None,
                 title_name: None,
+                summary: None,
             },
         );
         let history = SessionHistorySnapshot {
@@ -1904,12 +1933,15 @@ mod tests {
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd,
                 worktree_space: None,
                 agent_order: Vec::new(),
                 tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes,
@@ -1945,16 +1977,20 @@ mod tests {
             completed: false,
             agent_timing: None,
             title_name: None,
+            summary: None,
         };
         SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 agent_order: Vec::new(),
                 tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
@@ -2016,6 +2052,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_preserves_summary() {
+        let cwd = std::env::current_dir().unwrap();
+        let first = TerminalId::alloc();
+        let mut snapshot = snapshot_with_pane_terminal_ids(cwd, Some(first.clone()), None);
+        snapshot.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&0)
+            .unwrap()
+            .summary = Some("Improve Agent Summary to be useful".into());
+
+        let terminals = restore_terminals(&snapshot);
+        assert_eq!(
+            terminals
+                .get(&first)
+                .and_then(|t| t.session_title.as_deref()),
+            Some("Improve Agent Summary to be useful")
+        );
+        assert_eq!(
+            terminals
+                .get(&first)
+                .and_then(|t| t.effective_title())
+                .as_deref(),
+            Some("Improve Agent Summary to be useful")
+        );
+    }
+
+    #[tokio::test]
     async fn restore_preserves_title_name() {
         let cwd = std::env::current_dir().unwrap();
         let first = TerminalId::alloc();
@@ -2027,10 +2090,14 @@ mod tests {
             .title_name = Some("herdr-pane-title".into());
 
         let terminals = restore_terminals(&snapshot);
+        assert_eq!(
+            terminals.get(&first).and_then(|t| t.title_name.as_deref()),
+            Some("herdr-pane-title")
+        );
         let names = crate::pane_names::assigned_names(&terminals);
         assert_eq!(
             names.get(&first).map(String::as_str),
-            Some("herdr-pane-title")
+            Some(crate::pane_names::base_name_for(&first.to_string()))
         );
     }
 

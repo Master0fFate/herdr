@@ -430,6 +430,7 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
     payload.extend_from_slice(&encode_varint_u32(0)); // RenderEncoding::SemanticFrame
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientKeybindings::Server
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientLaunchMode::App
+    payload.push(0); // host_terminal_program: None
 
     stream
         .write_all(&frame_message(&payload))
@@ -721,11 +722,12 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
         "reattached client should not disturb persisted agent working status"
     );
 
-    // Transition to idle and verify the persisted agent state changes.
+    // Transition to idle and verify the persisted agent state changes. A
+    // finish nobody has acknowledged reads as done.
     pane_report_agent(&api_socket, &pane_id, "pi", "idle", "cross-area-test");
     assert!(
-        wait_for_agent_status(&api_socket, &pane_id, "idle", Duration::from_secs(3)),
-        "pane agent status should transition to idle"
+        wait_for_agent_status(&api_socket, &pane_id, "done", Duration::from_secs(3)),
+        "pane agent status should transition to done"
     );
     cleanup_spawned_herdr(server, base);
 }

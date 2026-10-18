@@ -195,6 +195,7 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub commander: CommanderConfig,
 }
 
 #[derive(Debug)]
@@ -244,8 +245,15 @@ pub struct KeysConfig {
     pub goto: BindingConfig,
     /// Focus the composer above the tabs. Default: "prefix+/"
     pub composer: BindingConfig,
+    /// Open the Commander, the box at the bottom of the frame that turns a
+    /// typed line into a herdr action or a message for a pane. Default: "f2".
+    /// Terminals never receive the keyboard's Fn key itself, so a function key
+    /// is the closest binding a terminal program can have.
+    pub commander: BindingConfig,
     /// Toggle sidebar collapse. Default: "prefix+b"
     pub toggle_sidebar: BindingConfig,
+    /// Toggle agent table collapse. Default: "prefix+shift+b"
+    pub toggle_agent_table: BindingConfig,
     /// Move workspace selection up in navigate mode. Default: "up".
     pub navigate_workspace_up: BindingConfig,
     /// Move workspace selection down in navigate mode. Default: "down".
@@ -274,8 +282,20 @@ pub struct KeysConfig {
     pub next_agent: BindingConfig,
     /// Focus an agent by index 1-9. Unset by default.
     pub focus_agent: BindingConfig,
+    /// Create a new tab in the active workspace. Default: "prefix+c"
+    pub new_tab: BindingConfig,
+    /// Rename the active tab. Default: "prefix+shift+t".
+    pub rename_tab: BindingConfig,
+    /// Select the previous tab. Default: "prefix+p".
+    pub previous_tab: BindingConfig,
+    /// Select the next tab. Default: "prefix+n".
+    pub next_tab: BindingConfig,
+    /// Switch to tab 1-9. Default: "prefix+1..9".
+    pub switch_tab: BindingConfig,
     /// Switch to workspace 1-9 from prefix mode. Unset by default.
     pub switch_workspace: BindingConfig,
+    /// Close the active tab. Default: "prefix+shift+x".
+    pub close_tab: BindingConfig,
     /// Rename the focused pane. Default: "prefix+shift+p".
     pub rename_pane: BindingConfig,
     /// Open the focused pane scrollback in $EDITOR. Default: "prefix+e".
@@ -325,6 +345,8 @@ pub struct KeysConfig {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct IndexedKeysConfig {
+    /// Modifier combo for tab shortcuts 1-9. Unset by default.
+    pub tabs: String,
     /// Modifier combo for workspace shortcuts 1-9. Unset by default.
     pub workspaces: String,
     /// Modifier combo for agent shortcuts 1-9. Unset by default.
@@ -367,10 +389,18 @@ pub struct UiConfig {
     pub mouse_scroll_lines: Option<NonZeroUsize>,
     /// Ask for confirmation before closing a workspace. Default: true.
     pub confirm_close: bool,
+    /// Ask for a tab name before creating a new tab. Default: true.
+    pub prompt_new_tab_name: bool,
+    /// Acknowledge a finished agent when its pane is focused. Default: false.
+    pub acknowledge_on_pane_focus: bool,
     /// Use Nerd Font glyphs in optional UI chrome. Default: false.
     pub nerd_font: bool,
     /// Show agent labels in split pane borders when no manual pane label is set. Default: false.
     pub show_agent_labels_on_pane_borders: bool,
+    /// Which fields a pane's top edge writes besides the chrome itself.
+    pub pane_header: PaneHeaderConfig,
+    /// Allowance block in the sidebar and the 10% left alert.
+    pub usage: UsageDisplayConfig,
     /// Accent color for highlights, borders, and navigation UI.
     /// Accepts hex (#89b4fa), named colors (cyan, blue), or RGB (rgb(137,180,250)).
     pub accent: String,
@@ -382,7 +412,20 @@ pub struct UiConfig {
     pub toast: ToastConfig,
     /// Play sounds when agents change state in background workspaces.
     pub sound: SoundConfig,
+    /// Refresh Summary asks a headless `grok -p` session for a 5–8 word
+    /// headline of the latest user request. Off, it reads the latest prompt
+    /// from the session log the way the automatic fill does.
+    pub refresh_summary_with_grok: bool,
+    /// The agent table and the mobile agents list show only agents that are
+    /// not in a space: the ones set down out of every layout.
+    pub hide_attached_agents: bool,
+    /// Prompt sent to that headless session. Empty uses
+    /// [`DEFAULT_REFRESH_SUMMARY_PROMPT`].
+    pub refresh_summary_prompt: String,
 }
+
+/// Default headline ask for Refresh Summary's headless `grok -p` session.
+pub const DEFAULT_REFRESH_SUMMARY_PROMPT: &str = "In 5-8 words, name the most recent thing the user asked this AI to do. Reply with only that sentence.";
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -417,6 +460,43 @@ pub struct AdvancedConfig {
     /// Maximum scrollback buffer size in bytes retained per pane terminal. Default: 10000000.
     #[serde(alias = "scrollback_lines")]
     pub scrollback_limit_bytes: usize,
+}
+
+/// `[commander]`: how the Commander reads what is typed into it.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct CommanderConfig {
+    /// TypeSafe API key for Jev. When set, the Commander asks Jev what a line
+    /// means instead of matching it against fixed phrases. The
+    /// `TYPESAFE_API_KEY` environment variable is used when this is unset.
+    pub jev_api_key: Option<String>,
+    /// The TypeSafe model that reads the line. Default: "jev-latest".
+    pub jev_model: String,
+    /// The model a headless Claude Code runs to work out which commands of a
+    /// line must wait for which, so the rest run at the same time. Empty runs
+    /// every command in the order written. Default: "claude-opus-5-5".
+    pub planner_model: String,
+}
+
+impl Default for CommanderConfig {
+    fn default() -> Self {
+        Self {
+            jev_api_key: None,
+            jev_model: "jev-latest".to_string(),
+            planner_model: "claude-opus-5-5".to_string(),
+        }
+    }
+}
+
+impl CommanderConfig {
+    /// The key to use: the config's, else the environment's. Blank is none.
+    pub fn api_key(&self) -> Option<String> {
+        self.jev_api_key
+            .clone()
+            .or_else(|| std::env::var("TYPESAFE_API_KEY").ok())
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -490,7 +570,9 @@ impl Default for KeysConfig {
             workspace_picker: BindingConfig::one("prefix+w"),
             goto: BindingConfig::one("prefix+g"),
             composer: BindingConfig::one("prefix+/"),
+            commander: BindingConfig::one("f2"),
             toggle_sidebar: BindingConfig::one("prefix+b"),
+            toggle_agent_table: BindingConfig::one("prefix+shift+b"),
             navigate_workspace_up: BindingConfig::one("up"),
             navigate_workspace_down: BindingConfig::one("down"),
             navigate_pane_left: BindingConfig::one("h"),
@@ -505,7 +587,13 @@ impl Default for KeysConfig {
             previous_agent: BindingConfig::empty(),
             next_agent: BindingConfig::empty(),
             focus_agent: BindingConfig::empty(),
+            new_tab: BindingConfig::one("prefix+c"),
+            rename_tab: BindingConfig::one("prefix+shift+t"),
+            previous_tab: BindingConfig::one("prefix+p"),
+            next_tab: BindingConfig::one("prefix+n"),
+            switch_tab: BindingConfig::one("prefix+1..9"),
             switch_workspace: BindingConfig::empty(),
+            close_tab: BindingConfig::one("prefix+shift+x"),
             rename_pane: BindingConfig::one("prefix+shift+p"),
             edit_scrollback: BindingConfig::one("prefix+e"),
             copy_mode: BindingConfig::one("prefix+["),
@@ -554,12 +642,225 @@ impl Default for UiConfig {
             hide_cursor_when_unfocused: true,
             mouse_scroll_lines: None,
             confirm_close: true,
+            prompt_new_tab_name: true,
+            acknowledge_on_pane_focus: false,
             nerd_font: false,
             show_agent_labels_on_pane_borders: true,
+            pane_header: PaneHeaderConfig::default(),
+            usage: UsageDisplayConfig::default(),
             accent: "cyan".into(),
             notify_active_tab: false,
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
+            refresh_summary_with_grok: false,
+            hide_attached_agents: false,
+            refresh_summary_prompt: DEFAULT_REFRESH_SUMMARY_PROMPT.into(),
+        }
+    }
+}
+
+/// Fields drawn on a pane's top edge. Status and name are on by default; the
+/// rest match the current name-only titles until someone turns them on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct PaneHeaderConfig {
+    /// The agent's status mark before its name: the spinner while it works,
+    /// and the dot, clickable into a check, once it finishes.
+    pub status: bool,
+    pub agent_name: bool,
+    pub hostname: bool,
+    pub working_directory: bool,
+    pub parent_directory: bool,
+    pub git_branch: bool,
+    pub git_status: bool,
+    /// Allowance meters for the provider of the pane's agent, after git status.
+    /// Off by default. Turn it on here or in Settings, pane labels.
+    pub usage: bool,
+}
+
+impl Default for PaneHeaderConfig {
+    fn default() -> Self {
+        Self {
+            status: true,
+            agent_name: true,
+            hostname: false,
+            working_directory: false,
+            parent_directory: false,
+            git_branch: false,
+            git_status: false,
+            usage: false,
+        }
+    }
+}
+
+/// Where the allowance meters show, and the voice alert at 10% left. The pane
+/// header's own switch is `[ui.pane_header] usage`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct UsageDisplayConfig {
+    /// Show the Allowance column in the agent table. Default: false.
+    /// Turn it on here or in Settings, pane labels.
+    pub table: bool,
+    /// Show the allowance block under the sidebar's lists. Default: true.
+    pub sidebar: bool,
+    /// Speak once per window when it reaches 10% left. Default: false.
+    pub alerts: bool,
+    /// When alerts are on, also speak once when that window resets or climbs
+    /// back above 10% left. Default: true. Set false to keep only the low alert.
+    pub alert_on_recovery: bool,
+    /// Pane name that also receives the recovery line. Empty sends nothing.
+    pub alert_pane: String,
+    /// Permit importing cursor.com browser cookies. Enable with `herdr usage cursor-login`.
+    pub cursor_login: bool,
+    /// Show Claude status line meters while continuing to record usage. Default: false.
+    /// Turn it on here or in Settings, pane labels. Recording continues either way.
+    pub claude_statusline: bool,
+    /// `both` draws both Cursor pools, labelled `cm` and `om`, in the table and sidebar.
+    /// `tighter` draws only the pool with less left. Default: both.
+    /// A pane header always draws the tighter pool, labelled `cm` or `om`.
+    pub cursor_pools: CursorPools,
+    pub codex_home: Option<String>,
+    /// Program and arguments; the spoken phrase is appended as the final argument.
+    pub alert_command: String,
+}
+
+impl Default for UsageDisplayConfig {
+    fn default() -> Self {
+        Self {
+            table: false,
+            sidebar: true,
+            alerts: false,
+            alert_on_recovery: true,
+            alert_pane: String::new(),
+            cursor_login: false,
+            claude_statusline: false,
+            cursor_pools: CursorPools::Both,
+            codex_home: None,
+            alert_command: String::new(),
+        }
+    }
+}
+
+/// Which Cursor pools the table and sidebar draw. The pane header always
+/// draws the tighter pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorPools {
+    #[default]
+    Both,
+    Tighter,
+}
+
+/// The `[ui.usage]` switches Settings lists under the pane header fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageSwitch {
+    Table,
+    Sidebar,
+    Alerts,
+    ClaudeStatusline,
+    CursorLogin,
+}
+
+impl UsageSwitch {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Table,
+        Self::Sidebar,
+        Self::Alerts,
+        Self::ClaudeStatusline,
+        Self::CursorLogin,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Table => "usage in the agent table",
+            Self::Sidebar => "usage in the sidebar",
+            Self::Alerts => "usage alert, spoken at 10% left",
+            Self::ClaudeStatusline => "usage in the Claude status line",
+            Self::CursorLogin => "Cursor browser login (run herdr usage cursor-login)",
+        }
+    }
+
+    pub(crate) fn config_key(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Sidebar => "sidebar",
+            Self::Alerts => "alerts",
+            Self::ClaudeStatusline => "claude_statusline",
+            Self::CursorLogin => "cursor_login",
+        }
+    }
+
+    pub(crate) fn enabled(self, config: &UsageDisplayConfig) -> bool {
+        match self {
+            Self::Table => config.table,
+            Self::Sidebar => config.sidebar,
+            Self::Alerts => config.alerts,
+            Self::ClaudeStatusline => config.claude_statusline,
+            Self::CursorLogin => config.cursor_login,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneHeaderField {
+    Status,
+    AgentName,
+    Hostname,
+    WorkingDirectory,
+    ParentDirectory,
+    GitBranch,
+    GitStatus,
+    Usage,
+}
+
+impl PaneHeaderField {
+    pub(crate) const ALL: [Self; 8] = [
+        Self::Status,
+        Self::AgentName,
+        Self::Hostname,
+        Self::WorkingDirectory,
+        Self::ParentDirectory,
+        Self::GitBranch,
+        Self::GitStatus,
+        Self::Usage,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::AgentName => "agent name",
+            Self::Hostname => "hostname",
+            Self::WorkingDirectory => "working directory",
+            Self::ParentDirectory => "parent directory",
+            Self::GitBranch => "git branch",
+            Self::GitStatus => "git status",
+            Self::Usage => "usage",
+        }
+    }
+
+    pub(crate) fn config_key(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::AgentName => "agent_name",
+            Self::Hostname => "hostname",
+            Self::WorkingDirectory => "working_directory",
+            Self::ParentDirectory => "parent_directory",
+            Self::GitBranch => "git_branch",
+            Self::GitStatus => "git_status",
+            Self::Usage => "usage",
+        }
+    }
+
+    pub(crate) fn enabled(self, header: PaneHeaderConfig) -> bool {
+        match self {
+            Self::Status => header.status,
+            Self::AgentName => header.agent_name,
+            Self::Hostname => header.hostname,
+            Self::WorkingDirectory => header.working_directory,
+            Self::ParentDirectory => header.parent_directory,
+            Self::GitBranch => header.git_branch,
+            Self::GitStatus => header.git_status,
+            Self::Usage => header.usage,
         }
     }
 }
@@ -704,6 +1005,100 @@ show_agent_labels_on_pane_borders = false
     }
 
     #[test]
+    fn usage_field_has_a_label_and_the_config_key_usage() {
+        assert_eq!(PaneHeaderField::Usage.label(), "usage");
+        assert_eq!(PaneHeaderField::Usage.config_key(), "usage");
+        let mut header = PaneHeaderConfig::default();
+        assert!(!PaneHeaderField::Usage.enabled(header));
+        header.usage = true;
+        assert!(PaneHeaderField::Usage.enabled(header));
+        let config: Config = toml::from_str("[ui.pane_header]\nusage = false\n").unwrap();
+        assert!(!config.ui.pane_header.usage);
+        // Shown last, after git status.
+        assert_eq!(PaneHeaderField::ALL.last(), Some(&PaneHeaderField::Usage));
+    }
+
+    #[test]
+    fn usage_switches_name_their_config_keys() {
+        let mut config = UsageDisplayConfig::default();
+        for switch in UsageSwitch::ALL {
+            assert_eq!(
+                switch.enabled(&config),
+                matches!(switch, UsageSwitch::Sidebar)
+            );
+        }
+        config.table = false;
+        assert!(!UsageSwitch::Table.enabled(&config));
+        assert_eq!(UsageSwitch::Table.config_key(), "table");
+        assert_eq!(UsageSwitch::Sidebar.config_key(), "sidebar");
+        assert_eq!(UsageSwitch::Alerts.config_key(), "alerts");
+    }
+
+    #[test]
+    fn usage_display_defaults_on_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.ui.usage.table);
+        assert!(default_config.ui.usage.sidebar);
+        assert!(!default_config.ui.usage.alerts);
+        assert!(default_config.ui.usage.alert_on_recovery);
+        assert!(default_config.ui.usage.alert_pane.is_empty());
+        assert!(!default_config.ui.usage.cursor_login);
+        assert!(!default_config.ui.usage.claude_statusline);
+        assert_eq!(default_config.ui.usage.cursor_pools, CursorPools::Both);
+        let config: Config =
+            toml::from_str("[ui.usage]\ntable = false\nsidebar = false\nalerts = false\n").unwrap();
+        assert!(!config.ui.usage.table);
+        assert!(!config.ui.usage.sidebar);
+        assert!(!config.ui.usage.alerts);
+        let kept: Config = toml::from_str(
+            "[ui.usage]\ntable = true\nclaude_statusline = true\n[ui.pane_header]\nusage = true\n",
+        )
+        .unwrap();
+        assert!(kept.ui.usage.table);
+        assert!(kept.ui.usage.sidebar);
+        assert!(kept.ui.usage.claude_statusline);
+        assert!(kept.ui.pane_header.usage);
+        let recovery: Config =
+            toml::from_str("[ui.usage]\nalert_on_recovery = false\nalert_pane = \"Eleanor\"\n")
+                .unwrap();
+        assert!(!recovery.ui.usage.alert_on_recovery);
+        assert_eq!(recovery.ui.usage.alert_pane, "Eleanor");
+        assert!(recovery.ui.usage.sidebar);
+        assert_eq!(recovery.ui.usage.cursor_pools, CursorPools::Both);
+        let pools: Config = toml::from_str("[ui.usage]\ncursor_pools = \"tighter\"\n").unwrap();
+        assert_eq!(pools.ui.usage.cursor_pools, CursorPools::Tighter);
+    }
+
+    #[test]
+    fn pane_header_defaults_to_status_and_name_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.ui.pane_header.status);
+        assert!(default_config.ui.pane_header.agent_name);
+        assert!(!default_config.ui.pane_header.working_directory);
+        assert!(!default_config.ui.pane_header.parent_directory);
+        assert!(!default_config.ui.pane_header.git_branch);
+        assert!(!default_config.ui.pane_header.git_status);
+        assert!(!default_config.ui.pane_header.usage);
+
+        let toml = r#"
+[ui.pane_header]
+status = false
+agent_name = false
+working_directory = true
+parent_directory = true
+git_branch = true
+git_status = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.pane_header.status);
+        assert!(!config.ui.pane_header.agent_name);
+        assert!(config.ui.pane_header.working_directory);
+        assert!(config.ui.pane_header.parent_directory);
+        assert!(config.ui.pane_header.git_branch);
+        assert!(config.ui.pane_header.git_status);
+    }
+
+    #[test]
     fn worktrees_directory_defaults_and_parses() {
         let default_config = Config::default();
         assert_eq!(default_config.worktrees.directory, ".herdr/worktrees");
@@ -715,6 +1110,30 @@ directory = "~/Projects/herdr-worktrees"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.worktrees.directory, "~/Projects/herdr-worktrees");
     }
+    #[test]
+    fn acknowledge_on_pane_focus_defaults_off_and_parses() {
+        let absent: Config = toml::from_str("[ui]\nprompt_new_tab_name = false").unwrap();
+        assert!(!absent.ui.acknowledge_on_pane_focus);
+        for enabled in [false, true] {
+            let config: Config =
+                toml::from_str(&format!("[ui]\nacknowledge_on_pane_focus = {enabled}")).unwrap();
+            assert_eq!(config.ui.acknowledge_on_pane_focus, enabled);
+        }
+    }
+
+    #[test]
+    fn prompt_new_tab_name_defaults_on_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.ui.prompt_new_tab_name);
+
+        let toml = r#"
+[ui]
+prompt_new_tab_name = false
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.ui.prompt_new_tab_name);
+    }
+
     #[test]
     fn nerd_font_default_off_and_parses() {
         let default_config = Config::default();
@@ -1054,6 +1473,48 @@ delivery = "terminal"
         assert_eq!(
             config.advanced.scrollback_limit_bytes,
             DEFAULT_SCROLLBACK_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn refresh_summary_with_grok_is_opt_in() {
+        assert!(!Config::default().ui.refresh_summary_with_grok);
+
+        let toml = r#"
+[ui]
+refresh_summary_with_grok = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.refresh_summary_with_grok);
+    }
+
+    #[test]
+    fn hide_attached_agents_is_opt_in() {
+        assert!(!Config::default().ui.hide_attached_agents);
+
+        let toml = r#"
+[ui]
+hide_attached_agents = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.ui.hide_attached_agents);
+    }
+
+    #[test]
+    fn refresh_summary_prompt_defaults_to_the_built_in_ask() {
+        assert_eq!(
+            Config::default().ui.refresh_summary_prompt,
+            DEFAULT_REFRESH_SUMMARY_PROMPT
+        );
+
+        let toml = r#"
+[ui]
+refresh_summary_prompt = "Name this in three words."
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.ui.refresh_summary_prompt,
+            "Name this in three words."
         );
     }
 

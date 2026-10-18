@@ -6,10 +6,14 @@ use ratatui::{
 };
 
 mod agent_table;
+mod commander;
 mod composer;
+mod describe_dialog;
 mod dialogs;
 mod keybind_help;
 mod menus;
+mod minimap;
+pub(crate) use self::minimap::minimap_pane_at;
 mod mobile;
 mod navigator;
 mod onboarding;
@@ -19,15 +23,19 @@ mod scrollbar;
 mod settings;
 mod sidebar;
 mod status;
+mod tabs;
+pub(crate) mod usage_bar;
 mod widgets;
 
 use self::agent_table::render_global_launcher;
 pub(crate) use self::agent_table::{
-    agent_panel_entries, agent_panel_entries_from, compute_agent_locations, render_agent_table,
-    sort_agent_table_by_column, split_agent_table, AgentLocation, AgentTableLayout, AgentTableRow,
+    agent_panel_entries, agent_panel_entries_from, all_agent_panel_entries,
+    compute_agent_locations, move_listed_agent, render_agent_table, sort_agent_table_by_column,
+    split_agent_table, AgentLocation, AgentTableLayout, AgentTableRow,
 };
 pub(crate) use self::composer::ComposerLayout;
 use self::composer::{render_composer, render_composer_dropdown};
+use self::describe_dialog::{render_describe_dialog, render_flyouts};
 use self::dialogs::{
     render_confirm_close_agent_overlay, render_confirm_close_overlay, render_land_worktree_overlay,
     render_new_linked_worktree_overlay, render_open_existing_worktree_overlay,
@@ -46,6 +54,7 @@ use self::mobile::{
 use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
+pub(crate) use self::panes::pane_pop_out_title;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
@@ -60,9 +69,10 @@ pub(crate) use self::scrollbar::{
 use self::settings::render_settings_overlay;
 pub(crate) use self::sidebar::{
     agent_folder_position, collapsed_sidebar_sections, collapsed_sidebar_toggle_rect,
-    compute_workspace_card_areas, compute_workspace_list_areas, expanded_sidebar_toggle_rect,
-    new_workspace_button_rect, normalized_workspace_scroll, render_sidebar,
-    spaces_section_collapsed, spaces_section_header_rect, workspace_agent_groups,
+    compute_pane_row_areas, compute_workspace_card_areas, compute_workspace_list_areas,
+    expanded_sidebar_toggle_rect, listed_name_column, new_workspace_button_rect,
+    normalized_workspace_scroll, render_sidebar, spaces_section_collapsed,
+    spaces_section_header_rect, tab_preview_rect, tab_preview_toggle_rect, workspace_agent_groups,
     workspace_agents_expanded, workspace_drop_indicator_row, workspace_list_entries,
     workspace_list_rect, workspace_list_scroll_metrics, workspace_list_scrollbar_rect,
     workspace_parent_group_state, AgentFolderGroup, WorkspaceListEntry,
@@ -72,8 +82,13 @@ use self::status::{
     render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
 };
+use self::tabs::{compute_tab_bar_view, render_tab_bar};
 pub(crate) use self::{
     composer::split_composer,
+    describe_dialog::{
+        describe_dialog_layout, describe_dialog_list_first, describe_dialog_text_first,
+        describe_dialog_text_width,
+    },
     keybind_help::keybind_help_lines,
     mobile::{
         mobile_switcher_areas, mobile_switcher_max_scroll, mobile_switcher_target_at,
@@ -92,25 +107,33 @@ pub(crate) use self::{
         remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
     },
     settings::{
-        settings_button_rects, settings_show_primary_action, SOUND_ALERT_ROWS_OFFSET,
-        SOUND_CHOICE_ROWS_OFFSET,
+        experiments_prompt_rect, pane_labels_window, settings_button_rects,
+        settings_show_primary_action, COMMANDER_JEV_ROW_OFFSET, COMMANDER_KEY_ROW_OFFSET,
+        EXPERIMENTS_CHECKBOX_ROWS_OFFSET, PANE_LABELS_LIST_OFFSET, SETTINGS_POPUP_HEIGHT,
+        SETTINGS_POPUP_WIDTH, SOUND_ALERT_ROWS_OFFSET, SOUND_CHOICE_ROWS_OFFSET,
     },
 };
 use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
-/// The `arc` set from FGRibreau's spinners: an arc segment sweeping around a
-/// circle. Not braille, on purpose — a braille cell is drawn small and faint in
-/// many terminal fonts, which turns a spinner into a character that twitches
-/// rather than a shape that turns. These six frames are quadrant arcs, which
-/// every font draws at full weight.
-const SPINNERS: &[&str] = &["◜", "◠", "◝", "◞", "◡", "◟"];
+/// The `bounce` set from sindresorhus/cli-spinners: one braille dot moving
+/// down the left column of its cell and back up.
+const SPINNERS: &[&str] = &["⠁", "⠂", "⠄", "⠂"];
+/// How long each frame holds, which is the set's own interval.
+const SPINNER_FRAME_MS: u128 = 120;
 
-/// Map spinner_tick, which counts 16ms animation ticks, to a spinner frame. The
-/// set holds one frame per 80ms, so every fifth tick turns it.
+/// Map spinner_tick, which counts animation ticks, to a spinner frame. The
+/// tick is turned back into elapsed time first, because the set's interval is
+/// not a whole number of ticks.
 pub(super) fn spinner_frame(tick: u32) -> &'static str {
-    SPINNERS[(tick / crate::app::ANIMATION_TICKS_PER_FRAME) as usize % SPINNERS.len()]
+    let elapsed = tick as u128 * crate::app::ANIMATION_INTERVAL.as_millis();
+    SPINNERS[(elapsed / SPINNER_FRAME_MS) as usize % SPINNERS.len()]
+}
+
+/// Shared phase for pending-completion attention in tabs and pane headers.
+pub(super) fn completion_blink_on(tick: u32) -> bool {
+    (tick / 4).is_multiple_of(2)
 }
 
 /// Compute view geometry and reconcile pane sizes.
@@ -191,6 +214,20 @@ fn compute_view_internal(
     // never feed back into the list.
     agent_table::sync_agent_order(app);
 
+    // The one clock read for allowance countdowns; drawing only reads this.
+    app.usage_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+
+    // The purpose area wraps at its own width, which depends on the frame.
+    if let Some(dialog) = app.describe_dialog.as_mut() {
+        let width = describe_dialog_text_width(dialog, area);
+        dialog.text.set_width(width);
+    }
+
+    app.view.ssh_hosts = self::panes::compute_ssh_hosts(app, terminal_runtimes);
+    self::commander::compute_commander(app, area);
+
     if is_mobile_width(area, app.mobile_width_threshold) {
         // Mobile has no sidebar, so the composer still spans the frame.
         let (composer, area) = split_composer(app, area);
@@ -220,10 +257,36 @@ fn compute_view_internal(
         area.height,
     );
 
+    let (composer, main_area) = split_composer(app, main_area);
+    let (agent_table, main_area) = split_agent_table(app, main_area);
+
+    let has_tabs = app.active.and_then(|i| app.workspaces.get(i)).is_some();
+    let (tab_bar_rect, terminal_area) = if has_tabs && main_area.height > 1 {
+        let [tab_bar_rect, terminal_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main_area);
+        (tab_bar_rect, terminal_area)
+    } else {
+        (Rect::default(), main_area)
+    };
+    // Tab rows in the sidebar size their layout previews to this area's shape,
+    // so it has to be in place before the sidebar is measured.
+    app.view.terminal_area = terminal_area;
     app.workspace_scroll = normalized_workspace_scroll(app, sidebar_rect, app.workspace_scroll);
 
-    let (composer, main_area) = split_composer(app, main_area);
-    let (agent_table, terminal_area) = split_agent_table(app, main_area);
+    let tab_bar_view = app
+        .active
+        .and_then(|i| app.workspaces.get(i))
+        .map(|ws| {
+            compute_tab_bar_view(
+                ws,
+                tab_bar_rect,
+                app.tab_scroll,
+                app.tab_scroll_follow_active,
+                app.mouse_capture,
+            )
+        })
+        .unwrap_or_default();
+    app.tab_scroll = tab_bar_view.scroll;
 
     let split_borders = if app.agent_peek.is_some() {
         Vec::new()
@@ -256,21 +319,36 @@ fn compute_view_internal(
         .map(|toast| toast_notification_rect(terminal_area, toast, app.config_diagnostic.is_some()))
         .unwrap_or_default();
 
-    let (workspace_card_areas, agent_row_areas, agent_folder_areas) = if app.sidebar_collapsed {
-        (Vec::new(), Vec::new(), Vec::new())
+    let (workspace_card_areas, tab_row_areas, agent_row_areas, agent_folder_areas) =
+        if app.sidebar_collapsed {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        } else {
+            compute_workspace_list_areas(app, sidebar_rect)
+        };
+    let pane_row_areas = if app.sidebar_collapsed {
+        Vec::new()
     } else {
-        compute_workspace_list_areas(app, sidebar_rect)
+        compute_pane_row_areas(app, sidebar_rect)
     };
     let agent_locations = std::mem::take(&mut app.view.agent_locations);
+    let ssh_hosts = std::mem::take(&mut app.view.ssh_hosts);
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         composer,
         sidebar_rect,
         workspace_card_areas,
+        tab_row_areas,
         agent_row_areas,
         agent_folder_areas,
+        pane_row_areas,
         agent_table,
         agent_locations,
+        ssh_hosts,
+        tab_bar_rect,
+        tab_hit_areas: tab_bar_view.tab_hit_areas,
+        tab_scroll_left_hit_area: tab_bar_view.scroll_left_hit_area,
+        tab_scroll_right_hit_area: tab_bar_view.scroll_right_hit_area,
+        new_tab_hit_area: tab_bar_view.new_tab_hit_area,
         terminal_area,
         mobile_header_rect: Rect::default(),
         mobile_menu_hit_area: Rect::default(),
@@ -362,15 +440,24 @@ fn compute_mobile_view(
         .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
         .unwrap_or_default();
 
+    let ssh_hosts = std::mem::take(&mut app.view.ssh_hosts);
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         composer,
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
+        tab_row_areas: Vec::new(),
         agent_row_areas: Vec::new(),
         agent_folder_areas: Vec::new(),
+        pane_row_areas: Vec::new(),
         agent_table: crate::ui::AgentTableLayout::default(),
         agent_locations: std::collections::HashMap::new(),
+        ssh_hosts,
+        tab_bar_rect: Rect::default(),
+        tab_hit_areas: Vec::new(),
+        tab_scroll_left_hit_area: Rect::default(),
+        tab_scroll_right_hit_area: Rect::default(),
+        new_tab_hit_area: Rect::default(),
         terminal_area,
         mobile_header_rect: header_rect,
         mobile_menu_hit_area: header_hits.menu,
@@ -421,11 +508,16 @@ pub fn render_with_runtime_registry(
         let entries = agent_panel_entries_from(app, terminal_runtimes);
         render_agent_table(app, frame, &app.view.agent_table, &entries);
         render_global_launcher(app, frame);
+        render_tab_bar(app, frame, app.view.tab_bar_rect);
     }
     render_panes(app, terminal_runtimes, frame, terminal_area);
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
+
+    if app.view.layout != ViewLayout::Mobile {
+        render_flyouts(app, frame, frame.area());
+    }
 
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
@@ -444,7 +536,10 @@ pub fn render_with_runtime_registry(
             render_context_menu(app, frame);
         }
         Mode::Settings => render_settings_overlay(app, frame, frame.area()),
-        Mode::RenameWorkspace | Mode::RenamePane => render_rename_overlay(app, frame, frame.area()),
+        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+            render_rename_overlay(app, frame, frame.area())
+        }
+        Mode::DescribeDialog => render_describe_dialog(app, frame, frame.area()),
         Mode::NewLinkedWorktree => render_new_linked_worktree_overlay(app, frame, frame.area()),
         Mode::OpenExistingWorktree => {
             render_open_existing_worktree_overlay(app, frame, frame.area())
@@ -454,6 +549,7 @@ pub fn render_with_runtime_registry(
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
+        Mode::Commander => self::commander::render_commander(app, frame),
         // The composer band is chrome, not an overlay: it draws itself above.
         Mode::Composer | Mode::Terminal => {}
     }
@@ -468,6 +564,10 @@ pub fn render_with_runtime_registry(
     // Its open list is an overlay, though, and hangs over the panes — so it
     // goes on last, after everything it covers has been drawn.
     render_composer_dropdown(app, frame, &app.view.composer);
+
+    // The Commander's star only recolours what is already drawn, so it goes
+    // over everything, overlays included.
+    self::commander::render_commander_trail(app, frame);
 }
 
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
@@ -592,8 +692,8 @@ mod tests {
         app.mobile_width_threshold = 90;
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
         assert_eq!(app.view.layout, ViewLayout::Mobile);
-        assert_eq!(app.view.mobile_header_rect, Rect::new(0, 4, 80, 2));
-        assert_eq!(app.view.terminal_area, Rect::new(0, 6, 80, 14));
+        assert_eq!(app.view.mobile_header_rect, Rect::new(0, 2, 80, 2));
+        assert_eq!(app.view.terminal_area, Rect::new(0, 4, 80, 16));
     }
 
     #[test]
@@ -860,7 +960,7 @@ mod tests {
     }
 
     #[test]
-    fn the_done_marker_becomes_a_check_once_it_is_acknowledged() {
+    fn the_done_marker_toggles_between_a_dot_and_a_check() {
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("space");
         let pane_id = workspace.tabs[0].root_pane;
@@ -897,8 +997,12 @@ mod tests {
         compute_view(&mut app, Rect::new(0, 0, 106, 20));
         assert_eq!(marker(&app), "\u{25cf}");
 
-        assert!(app.acknowledge_agent_completion(pane_id));
+        assert!(app.toggle_agent_completion_acknowledgement(pane_id));
         compute_view(&mut app, Rect::new(0, 0, 106, 20));
         assert_eq!(marker(&app), "\u{2713}");
+
+        assert!(app.toggle_agent_completion_acknowledgement(pane_id));
+        compute_view(&mut app, Rect::new(0, 0, 106, 20));
+        assert_eq!(marker(&app), "\u{25cf}");
     }
 }

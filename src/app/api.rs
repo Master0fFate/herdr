@@ -6,6 +6,7 @@ mod integrations;
 mod panes;
 mod responses;
 mod tabs;
+mod view;
 mod workspaces;
 mod worktrees;
 
@@ -26,6 +27,18 @@ impl App {
             #[cfg(test)]
             let _ = content;
             self.show_clipboard_feedback();
+            return;
+        }
+
+        if let AppEvent::OscTitleChanged { pane_id, title } = ev {
+            if let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane_id) {
+                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                    if terminal.set_osc_title(title) {
+                        self.render_dirty.store(true, Ordering::Release);
+                        self.render_notify.notify_one();
+                    }
+                }
+            }
             return;
         }
 
@@ -54,6 +67,46 @@ impl App {
             return;
         }
 
+        if let AppEvent::SummaryRefreshed {
+            terminal_id,
+            session_id,
+            title,
+        } = ev
+        {
+            self.summary_refresh_in_flight.remove(&terminal_id);
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.summary_refreshing = false;
+                let still_current = terminal
+                    .model_probe_session()
+                    .is_some_and(|(_, current)| current == session_id);
+                if still_current {
+                    if title.is_some() {
+                        terminal.adopt_probed_title(title, true);
+                        self.state.mark_session_dirty();
+                    }
+                    self.render_dirty.store(true, Ordering::Release);
+                    self.render_notify.notify_one();
+                }
+            }
+            return;
+        }
+
+        if let AppEvent::UsageRefreshed { snapshot, finished } = ev {
+            if finished {
+                self.usage_refresh_landed(Instant::now());
+            }
+            if let Some(snapshot) = snapshot {
+                if self.state.usage_snapshot.as_ref() != Some(&snapshot) {
+                    self.state.usage_snapshot = Some(snapshot);
+                    self.render_dirty.store(true, Ordering::Release);
+                    self.render_notify.notify_one();
+                }
+            }
+            self.announce_allowance_recoveries();
+            self.sync_usage_redraw_deadline();
+            return;
+        }
+
         if let AppEvent::AgentModelRefreshed { results } = ev {
             self.agent_model_refresh_in_flight = false;
             self.last_agent_model_refresh = Instant::now();
@@ -67,12 +120,10 @@ impl App {
                         terminal.model_info = result.entry.info.clone();
                         changed = true;
                     }
-                    if still_current && terminal.session_title != result.entry.title {
-                        terminal.set_session_title(result.entry.title.clone());
-                        changed = true;
-                    } else if still_current && terminal.title_name.is_none() {
-                        terminal.freeze_title_name();
-                        if terminal.title_name.is_some() {
+                    if still_current {
+                        let before = terminal.session_title.clone();
+                        terminal.adopt_probed_title(result.entry.title.clone(), false);
+                        if terminal.session_title != before {
                             changed = true;
                         }
                     }
@@ -84,6 +135,54 @@ impl App {
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
             }
+            return;
+        }
+
+        if self.commander_busy
+            && matches!(
+                ev,
+                AppEvent::CommanderSplit { .. }
+                    | AppEvent::CommanderOrdered { .. }
+                    | AppEvent::CommanderRead { .. }
+            )
+        {
+            self.commander_deferred.push(ev);
+            return;
+        }
+
+        if let AppEvent::CommanderSplit {
+            generation,
+            line,
+            result,
+        } = ev
+        {
+            self.commander_split(generation, &line, result);
+            self.render_dirty.store(true, Ordering::Release);
+            self.render_notify.notify_one();
+            return;
+        }
+
+        if let AppEvent::CommanderOrdered {
+            generation,
+            line,
+            result,
+        } = ev
+        {
+            self.commander_ordered(generation, &line, result);
+            self.render_dirty.store(true, Ordering::Release);
+            self.render_notify.notify_one();
+            return;
+        }
+
+        if let AppEvent::CommanderRead {
+            generation,
+            line,
+            result,
+        } = ev
+        {
+            self.commander_read(generation, &line, result);
+            self.render_dirty.store(true, Ordering::Release);
+            self.render_notify.notify_one();
             return;
         }
 
@@ -642,6 +741,7 @@ impl App {
             Method::IntegrationUninstall(params) => {
                 return self.handle_integration_uninstall(request.id, params);
             }
+            Method::ViewSet(params) => return self.handle_view_set(request.id, params),
             _ => {
                 return responses::encode_error(
                     request.id,

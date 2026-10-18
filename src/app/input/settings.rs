@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::{
@@ -6,7 +6,7 @@ use crate::{
         state::{AppState, DoneSoundChoice, ExperimentSetting, SettingsSection, THEME_NAMES},
         App, Mode,
     },
-    config::ToastDelivery,
+    config::{PaneHeaderField, ToastDelivery, UsageSwitch},
 };
 
 /// Rows of the Sound section: the two alert toggle rows, then one row per
@@ -59,10 +59,37 @@ pub(super) enum SettingsAction {
     SaveSound(bool),
     SaveDoneSound(DoneSoundChoice),
     SaveToastDelivery(ToastDelivery),
-    SaveAgentBorderLabels(bool),
+    SavePaneHeaderField(PaneHeaderField, bool),
+    SaveUsageSwitch(UsageSwitch, bool),
     SavePaneHistory(bool),
     SaveSwitchAsciiInputSourceInPrefix(bool),
+    SaveRefreshSummaryWithGrok(bool),
+    SaveHideAttachedAgents(bool),
+    SaveAcknowledgeOnPaneFocus(bool),
+    /// The Commander's hotkey, written the way the config file writes keys.
+    SaveCommanderKey(String),
+    /// The TypeSafe key Jev is reached with; empty removes it.
+    SaveJevApiKey(String),
     InstallRecommendedIntegrations,
+}
+
+/// Map a pane-header row index to the toggle action that flips it.
+fn pane_header_toggle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
+    // The usage switches are listed under the header fields.
+    if let Some(switch) = idx
+        .checked_sub(PaneHeaderField::ALL.len())
+        .and_then(|row| UsageSwitch::ALL.get(row).copied())
+    {
+        return Some(SettingsAction::SaveUsageSwitch(
+            switch,
+            !switch.enabled(&state.usage_config),
+        ));
+    }
+    let field = *PaneHeaderField::ALL.get(idx)?;
+    Some(SettingsAction::SavePaneHeaderField(
+        field,
+        !field.enabled(state.pane_header()),
+    ))
 }
 
 /// Map an Experiments row index to the toggle action that flips it.
@@ -76,10 +103,48 @@ fn experiment_toggle_action(state: &AppState, idx: usize) -> Option<SettingsActi
                 !ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(state),
             ))
         }
+        ExperimentSetting::RefreshSummaryWithGrok => {
+            Some(SettingsAction::SaveRefreshSummaryWithGrok(
+                !ExperimentSetting::RefreshSummaryWithGrok.enabled(state),
+            ))
+        }
+        ExperimentSetting::AcknowledgeOnPaneFocus => {
+            Some(SettingsAction::SaveAcknowledgeOnPaneFocus(
+                !ExperimentSetting::AcknowledgeOnPaneFocus.enabled(state),
+            ))
+        }
+        ExperimentSetting::HideAttachedAgents => Some(SettingsAction::SaveHideAttachedAgents(
+            !ExperimentSetting::HideAttachedAgents.enabled(state),
+        )),
     }
 }
 
+fn stop_editing_refresh_prompt(state: &mut AppState) {
+    if state.settings.editing_refresh_prompt {
+        state.settings.editing_refresh_prompt = false;
+        state.request_save_refresh_summary_prompt = true;
+    }
+}
+
+fn begin_editing_refresh_prompt(state: &mut AppState) {
+    state.settings.editing_refresh_prompt = true;
+    if state.refresh_summary_prompt.trim().is_empty() {
+        state.refresh_summary_prompt = crate::config::DEFAULT_REFRESH_SUMMARY_PROMPT.into();
+    }
+}
+
+/// The Commander section's rows: the hotkey, then the Jev API key.
+const COMMANDER_ROWS: usize = 2;
+
 impl App {
+    /// A paste while settings are open goes into the Jev key field when it
+    /// is open, since pasting is how a key is usually entered.
+    pub(crate) fn settings_paste(&mut self, text: &str) {
+        if let Some(draft) = self.state.settings.editing_jev_key.as_mut() {
+            draft.push_str(text.trim());
+        }
+    }
+
     pub(crate) fn handle_settings_key(&mut self, key: KeyEvent) {
         let previous_section = self.state.settings.section;
         if let Some(action) = update_settings_state(&mut self.state, key) {
@@ -88,8 +153,11 @@ impl App {
                 SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
                 SettingsAction::SaveDoneSound(choice) => self.save_done_sound(&choice),
                 SettingsAction::SaveToastDelivery(delivery) => self.save_toast_delivery(delivery),
-                SettingsAction::SaveAgentBorderLabels(enabled) => {
-                    self.save_agent_border_labels(enabled)
+                SettingsAction::SavePaneHeaderField(field, enabled) => {
+                    self.save_pane_header_field(field, enabled)
+                }
+                SettingsAction::SaveUsageSwitch(switch, enabled) => {
+                    self.save_usage_switch(switch, enabled)
                 }
                 SettingsAction::SavePaneHistory(enabled) => {
                     self.save_pane_history_persistence(enabled)
@@ -97,11 +165,23 @@ impl App {
                 SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
                     self.save_switch_ascii_input_source_in_prefix(enabled)
                 }
+                SettingsAction::SaveRefreshSummaryWithGrok(enabled) => {
+                    self.save_refresh_summary_with_grok(enabled)
+                }
+                SettingsAction::SaveHideAttachedAgents(enabled) => {
+                    self.save_hide_attached_agents(enabled)
+                }
+                SettingsAction::SaveAcknowledgeOnPaneFocus(enabled) => {
+                    self.save_acknowledge_on_pane_focus(enabled)
+                }
+                SettingsAction::SaveCommanderKey(combo) => self.save_commander_key(&combo),
+                SettingsAction::SaveJevApiKey(key) => self.save_jev_api_key(&key),
                 SettingsAction::InstallRecommendedIntegrations => {
                     self.install_recommended_integrations()
                 }
             }
         }
+        self.flush_refresh_summary_prompt_save();
         if previous_section != SettingsSection::Integrations
             && self.state.settings.section == SettingsSection::Integrations
         {
@@ -151,6 +231,7 @@ fn preview_selected_theme(state: &mut AppState) {
 }
 
 fn cancel_settings(state: &mut AppState) {
+    stop_editing_refresh_prompt(state);
     if let Some(palette) = state.settings.original_palette.take() {
         state.palette = palette;
     }
@@ -272,30 +353,6 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 state.settings.section = SettingsSection::PaneLabels;
-                state.settings.list.selected = usize::from(!state.agent_border_labels_enabled());
-            }
-            _ => {
-                if let Some(super::modal::ModalAction::Close) =
-                    super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS)
-                {
-                    cancel_settings(state);
-                }
-            }
-        },
-        SettingsSection::PaneLabels => match key.code {
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
-                state.settings.list.selected = 1 - state.settings.list.selected.min(1);
-            }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                let enabled = state.settings.list.selected == 0;
-                return Some(SettingsAction::SaveAgentBorderLabels(enabled));
-            }
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                state.settings.section = SettingsSection::Toast;
-                state.settings.list.selected = toast_delivery_index(state.toast_delivery());
-            }
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                state.settings.section = SettingsSection::Integrations;
                 state.settings.list.selected = 0;
             }
             _ => {
@@ -306,10 +363,70 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 }
             }
         },
+        SettingsSection::PaneLabels => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
+            KeyCode::Down | KeyCode::Char('j') => state
+                .settings
+                .list
+                .move_next(PaneHeaderField::ALL.len() + UsageSwitch::ALL.len()),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                return pane_header_toggle_action(state, state.settings.list.selected);
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::Toast;
+                state.settings.list.selected = toast_delivery_index(state.toast_delivery());
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::Commander;
+                state.settings.list.selected = 0;
+            }
+            _ => {
+                if let Some(super::modal::ModalAction::Close) =
+                    super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS)
+                {
+                    cancel_settings(state);
+                }
+            }
+        },
+        SettingsSection::Experiments if state.settings.editing_refresh_prompt => match key.code {
+            KeyCode::Esc => {
+                stop_editing_refresh_prompt(state);
+            }
+            KeyCode::Enter => state.refresh_summary_prompt.push('\n'),
+            KeyCode::Backspace => {
+                state.refresh_summary_prompt.pop();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                state.refresh_summary_prompt.push(c);
+            }
+            KeyCode::Up => {
+                stop_editing_refresh_prompt(state);
+                state.settings.list.selected = ExperimentSetting::ALL.len().saturating_sub(1);
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                stop_editing_refresh_prompt(state);
+                state.settings.section = SettingsSection::Integrations;
+                state.settings.list.selected = 0;
+            }
+            KeyCode::Tab | KeyCode::Right => {
+                stop_editing_refresh_prompt(state);
+                state.settings.section = SettingsSection::Theme;
+                state.settings.list.selected = current_theme_index(&state.theme_name);
+            }
+            _ => {}
+        },
         SettingsSection::Experiments => match key.code {
             KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
             KeyCode::Down | KeyCode::Char('j') => {
-                state.settings.list.move_next(ExperimentSetting::ALL.len())
+                if state.settings.list.selected + 1 >= ExperimentSetting::ALL.len() {
+                    begin_editing_refresh_prompt(state);
+                } else {
+                    state.settings.list.move_next(ExperimentSetting::ALL.len());
+                }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 return experiment_toggle_action(state, state.settings.list.selected);
@@ -330,13 +447,89 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 }
             }
         },
+        // While a key is being captured, every key but Esc is the answer,
+        // including the ones that would otherwise move between sections. A
+        // plain letter, digit or symbol is refused and the capture stays open:
+        // bound directly, it would swallow that character in every pane, and
+        // the config loader rejects it for that reason.
+        SettingsSection::Commander if state.settings.capturing_commander_key => {
+            let combo = (key.code, key.modifiers);
+            let name = crate::config::format_key_combo(combo);
+            if key.code == KeyCode::Esc {
+                state.settings.capturing_commander_key = false;
+                state.settings.refused_commander_key = None;
+            } else if crate::config::is_unmodified_printable(combo) {
+                state.settings.refused_commander_key = Some(name);
+            } else {
+                state.settings.capturing_commander_key = false;
+                state.settings.refused_commander_key = None;
+                return Some(SettingsAction::SaveCommanderKey(name));
+            }
+        }
+        // The key field takes typing and pastes until Enter saves it or Esc
+        // drops it. Nothing in it moves between sections.
+        SettingsSection::Commander if state.settings.editing_jev_key.is_some() => {
+            let draft = state
+                .settings
+                .editing_jev_key
+                .get_or_insert_with(String::new);
+            match key.code {
+                KeyCode::Esc => state.settings.editing_jev_key = None,
+                KeyCode::Enter => {
+                    let key = draft.trim().to_string();
+                    state.settings.editing_jev_key = None;
+                    return Some(SettingsAction::SaveJevApiKey(key));
+                }
+                KeyCode::Backspace => {
+                    draft.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    draft.clear();
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    draft.push(c);
+                }
+                _ => {}
+            }
+        }
+        SettingsSection::Commander => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.settings.list.move_next(COMMANDER_ROWS);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') if state.settings.list.selected == 1 => {
+                state.settings.editing_jev_key = Some(String::new());
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                state.settings.capturing_commander_key = true;
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::PaneLabels;
+                state.settings.list.selected = 0;
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::Integrations;
+                state.settings.list.selected = 0;
+            }
+            _ => {
+                if let Some(super::modal::ModalAction::Close) =
+                    super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS)
+                {
+                    cancel_settings(state);
+                }
+            }
+        },
         SettingsSection::Integrations => match key.code {
             KeyCode::Enter | KeyCode::Char(' ') if integrations_need_install(state) => {
                 return Some(SettingsAction::InstallRecommendedIntegrations);
             }
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                state.settings.section = SettingsSection::PaneLabels;
-                state.settings.list.selected = usize::from(!state.agent_border_labels_enabled());
+                state.settings.section = SettingsSection::Commander;
+                state.settings.list.selected = 0;
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
                 state.settings.section = SettingsSection::Experiments;
@@ -365,16 +558,25 @@ pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
         SettingsSection::Theme => current_theme_index(&state.theme_name),
         SettingsSection::Sound => sound_selected_index(state),
         SettingsSection::Toast => toast_delivery_index(state.toast_delivery()),
-        SettingsSection::PaneLabels => usize::from(!state.agent_border_labels_enabled()),
+        SettingsSection::PaneLabels => 0,
+        SettingsSection::Commander => 0,
         SettingsSection::Experiments => 0,
         SettingsSection::Integrations => 0,
     };
+    state.settings.editing_refresh_prompt = false;
+    state.settings.capturing_commander_key = false;
+    state.settings.editing_jev_key = None;
     state.mode = Mode::Settings;
 }
 
 impl AppState {
     fn settings_popup_rect(&self) -> Rect {
-        crate::ui::centered_popup_rect(self.screen_rect(), 76, 22).unwrap_or_default()
+        crate::ui::centered_popup_rect(
+            self.screen_rect(),
+            crate::ui::SETTINGS_POPUP_WIDTH,
+            crate::ui::SETTINGS_POPUP_HEIGHT,
+        )
+        .unwrap_or_default()
     }
 
     fn settings_inner_rect(&self) -> Rect {
@@ -453,15 +655,26 @@ impl AppState {
                 }
             }
             SettingsSection::PaneLabels => {
-                let list_y = area.y + 3;
-                if row >= list_y && row < list_y + 2 {
-                    Some((row - list_y) as usize)
+                let list_y = area.y + crate::ui::PANE_LABELS_LIST_OFFSET;
+                let (visible, scroll) =
+                    crate::ui::pane_labels_window(area.height, self.settings.list.selected);
+                if row >= list_y && row < list_y + visible as u16 {
+                    Some(scroll + (row - list_y) as usize)
+                } else {
+                    None
+                }
+            }
+            SettingsSection::Commander => {
+                if row == area.y + crate::ui::COMMANDER_KEY_ROW_OFFSET {
+                    Some(0)
+                } else if row == area.y + crate::ui::COMMANDER_JEV_ROW_OFFSET {
+                    Some(1)
                 } else {
                     None
                 }
             }
             SettingsSection::Experiments => {
-                let list_y = area.y + 3;
+                let list_y = area.y + crate::ui::EXPERIMENTS_CHECKBOX_ROWS_OFFSET;
                 if row >= list_y && row < list_y + ExperimentSetting::ALL.len() as u16 {
                     Some((row - list_y) as usize)
                 } else {
@@ -475,15 +688,33 @@ impl AppState {
     pub(super) fn handle_settings_mouse(&mut self, mouse: MouseEvent) -> Option<SettingsAction> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.settings.section == SettingsSection::Experiments {
+                    if let Some(prompt) =
+                        crate::ui::experiments_prompt_rect(self.settings_content_rect())
+                    {
+                        if mouse.column >= prompt.x
+                            && mouse.column < prompt.x + prompt.width
+                            && mouse.row >= prompt.y
+                            && mouse.row < prompt.y + prompt.height
+                        {
+                            begin_editing_refresh_prompt(self);
+                            return None;
+                        }
+                    }
+                }
+                if self.settings.editing_refresh_prompt {
+                    stop_editing_refresh_prompt(self);
+                }
+                self.settings.capturing_commander_key = false;
+                self.settings.editing_jev_key = None;
                 if let Some(section) = self.settings_tab_at(mouse.column, mouse.row) {
                     self.settings.section = section;
                     self.settings.list.select(match section {
                         SettingsSection::Theme => current_theme_index(&self.theme_name),
                         SettingsSection::Sound => sound_selected_index(self),
                         SettingsSection::Toast => toast_delivery_index(self.toast_delivery()),
-                        SettingsSection::PaneLabels => {
-                            usize::from(!self.agent_border_labels_enabled())
-                        }
+                        SettingsSection::PaneLabels => 0,
+                        SettingsSection::Commander => 0,
                         SettingsSection::Experiments => 0,
                         SettingsSection::Integrations => 0,
                     });
@@ -501,9 +732,14 @@ impl AppState {
                             let delivery = toast_delivery_for_index(idx);
                             Some(SettingsAction::SaveToastDelivery(delivery))
                         }
-                        SettingsSection::PaneLabels => {
-                            let enabled = idx == 0;
-                            Some(SettingsAction::SaveAgentBorderLabels(enabled))
+                        SettingsSection::PaneLabels => pane_header_toggle_action(self, idx),
+                        SettingsSection::Commander if idx == 1 => {
+                            self.settings.editing_jev_key = Some(String::new());
+                            None
+                        }
+                        SettingsSection::Commander => {
+                            self.settings.capturing_commander_key = true;
+                            None
                         }
                         SettingsSection::Experiments => experiment_toggle_action(self, idx),
                         SettingsSection::Integrations => None,
@@ -737,6 +973,74 @@ mod tests {
     }
 
     #[test]
+    fn settings_pane_header_enter_toggles_the_highlighted_field() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::PaneLabels);
+        assert!(state.pane_header.status);
+
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_eq!(
+            action,
+            Some(SettingsAction::SavePaneHeaderField(
+                PaneHeaderField::Status,
+                false
+            ))
+        );
+
+        for _ in 0..3 {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            action,
+            Some(SettingsAction::SavePaneHeaderField(
+                PaneHeaderField::WorkingDirectory,
+                true
+            ))
+        );
+        assert_eq!(state.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn settings_mouse_click_toggles_pane_header_git_branch() {
+        let mut app = app_for_mouse_test();
+        // Tall enough that the whole settings popup, every pane label row
+        // included, fits on screen.
+        app.state.view.terminal_area = Rect::new(0, 1, 106, 29);
+        open_settings_at(&mut app.state, SettingsSection::PaneLabels);
+
+        let row = PaneHeaderField::ALL
+            .iter()
+            .position(|&field| field == PaneHeaderField::GitBranch)
+            .expect("git branch is a pane header field") as u16;
+        let area = app.state.settings_content_rect();
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 2,
+            area.y + 3 + row,
+        ));
+
+        assert_eq!(
+            action,
+            Some(SettingsAction::SavePaneHeaderField(
+                PaneHeaderField::GitBranch,
+                true
+            ))
+        );
+        assert_eq!(app.state.settings.list.selected, row as usize);
+    }
+
+    #[test]
     fn settings_experiments_toggles_pane_history() {
         let mut state = state_with_workspaces(&["test"]);
         state.pane_history_persistence = false;
@@ -776,9 +1080,160 @@ mod tests {
     }
 
     #[test]
+    fn settings_experiments_toggles_refresh_summary_with_grok() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.refresh_summary_with_grok = false;
+        open_settings_at(&mut state, SettingsSection::Experiments);
+
+        let row = ExperimentSetting::ALL
+            .iter()
+            .position(|setting| *setting == ExperimentSetting::RefreshSummaryWithGrok)
+            .unwrap();
+        for _ in 0..row {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(state.settings.list.selected, row);
+
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveRefreshSummaryWithGrok(true))
+        );
+        assert_eq!(state.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn settings_experiments_toggles_acknowledge_on_pane_focus_by_keyboard_and_mouse() {
+        let row = ExperimentSetting::ALL
+            .iter()
+            .position(|setting| *setting == ExperimentSetting::AcknowledgeOnPaneFocus)
+            .unwrap();
+        for enabled in [false, true] {
+            let mut app = app_for_mouse_test();
+            app.state.acknowledge_on_pane_focus = enabled;
+            app.state.view.terminal_area = Rect::new(0, 0, 120, 40);
+            open_settings_at(&mut app.state, SettingsSection::Experiments);
+            for _ in 0..row {
+                update_settings_state(
+                    &mut app.state,
+                    KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+                );
+            }
+            assert_eq!(
+                update_settings_state(
+                    &mut app.state,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+                ),
+                Some(SettingsAction::SaveAcknowledgeOnPaneFocus(!enabled))
+            );
+            let area = app.state.settings_content_rect();
+            let action = app.state.handle_settings_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                area.x + 2,
+                area.y + crate::ui::EXPERIMENTS_CHECKBOX_ROWS_OFFSET + row as u16,
+            ));
+            assert_eq!(
+                action,
+                Some(SettingsAction::SaveAcknowledgeOnPaneFocus(!enabled))
+            );
+        }
+    }
+
+    #[test]
+    fn settings_experiments_toggles_hide_attached_agents() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Experiments);
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(state.settings.list.selected, 2);
+
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_eq!(action, Some(SettingsAction::SaveHideAttachedAgents(true)));
+    }
+
+    #[test]
+    fn settings_experiments_down_from_refresh_summary_edits_the_prompt() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Experiments);
+        let row = ExperimentSetting::ALL
+            .iter()
+            .position(|setting| *setting == ExperimentSetting::RefreshSummaryWithGrok)
+            .unwrap();
+        for _ in 0..row {
+            update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(state.settings.list.selected, row);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert!(state.settings.editing_refresh_prompt);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()),
+        );
+        assert!(state.refresh_summary_prompt.ends_with('x'));
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        assert!(!state.settings.editing_refresh_prompt);
+        assert!(state.request_save_refresh_summary_prompt);
+        assert_eq!(state.mode, Mode::Settings);
+    }
+
+    #[test]
+    fn settings_experiments_clicking_the_prompt_starts_editing() {
+        let mut app = app_for_mouse_test();
+        app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+        let area = app.state.settings_content_rect();
+        let prompt = crate::ui::experiments_prompt_rect(area).expect("prompt field fits");
+
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            prompt.x + 1,
+            prompt.y + 1,
+        ));
+
+        assert_eq!(action, None);
+        assert!(app.state.settings.editing_refresh_prompt);
+        assert_eq!(app.state.mode, Mode::Settings);
+    }
+
+    #[test]
     fn settings_tab_cycle_places_experiments_last() {
         let mut state = state_with_workspaces(&["test"]);
         open_settings_at(&mut state, SettingsSection::PaneLabels);
+
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
+        assert_eq!(state.settings.section, SettingsSection::Commander);
 
         update_settings_state(
             &mut state,
@@ -809,6 +1264,72 @@ mod tests {
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
         );
         assert_eq!(state.settings.section, SettingsSection::Integrations);
+    }
+
+    #[test]
+    fn the_next_key_becomes_the_commander_hotkey() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Commander);
+
+        let start = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(start, None);
+        assert!(state.settings.capturing_commander_key);
+
+        // Tab would change section; while capturing it is the answer instead.
+        let saved = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::empty()),
+        );
+        assert_eq!(saved, Some(SettingsAction::SaveCommanderKey("f3".into())));
+        assert!(!state.settings.capturing_commander_key);
+        assert_eq!(state.settings.section, SettingsSection::Commander);
+    }
+
+    #[test]
+    fn a_plain_letter_is_refused_and_the_capture_stays_open() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Commander);
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        let refused = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty()),
+        );
+        assert_eq!(refused, None);
+        assert!(state.settings.capturing_commander_key);
+        assert_eq!(state.settings.refused_commander_key.as_deref(), Some("m"));
+
+        let saved = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            saved,
+            Some(SettingsAction::SaveCommanderKey("ctrl+m".into()))
+        );
+        assert_eq!(state.settings.refused_commander_key, None);
+    }
+
+    #[test]
+    fn escape_abandons_a_commander_key_capture() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Commander);
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        assert_eq!(action, None);
+        assert!(!state.settings.capturing_commander_key);
+        assert_eq!(state.mode, Mode::Settings);
     }
 
     #[test]
@@ -856,6 +1377,54 @@ mod tests {
 
         assert_eq!(action, Some(SettingsAction::SavePaneHistory(true)));
         assert_eq!(app.state.settings.list.selected, 0);
+    }
+
+    #[test]
+    fn settings_clicks_hit_the_drawn_overlay_when_the_sidebar_is_open() {
+        let mut app = app_for_mouse_test();
+        app.state.pane_history_persistence = false;
+        let frame = Rect::new(0, 0, 120, 30);
+        crate::ui::compute_view(&mut app.state, frame);
+        open_settings_at(&mut app.state, SettingsSection::Experiments);
+
+        let drawn = crate::ui::centered_popup_rect(
+            frame,
+            crate::ui::SETTINGS_POPUP_WIDTH,
+            crate::ui::SETTINGS_POPUP_HEIGHT,
+        )
+        .expect("settings overlay fits");
+        assert_eq!(
+            app.state.settings_popup_rect(),
+            drawn,
+            "hit testing must use the same full-frame popup the overlay draws"
+        );
+
+        let inner = Rect::new(
+            drawn.x + 1,
+            drawn.y + 1,
+            drawn.width.saturating_sub(2),
+            drawn.height.saturating_sub(2),
+        );
+        let content = crate::ui::modal_stack_areas(inner, 3, 2, 0, 1).content;
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            content.x + 2,
+            content.y + 3,
+        ));
+
+        assert_eq!(action, Some(SettingsAction::SavePaneHistory(true)));
+        assert_eq!(app.state.mode, Mode::Settings);
+        assert_eq!(app.state.settings.list.selected, 0);
+
+        let show_primary = crate::ui::settings_show_primary_action(&app.state);
+        let (_apply, close) =
+            crate::ui::settings_button_rects(inner, SettingsSection::Experiments, show_primary);
+        app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            close.x + 1,
+            close.y,
+        ));
+        assert_ne!(app.state.mode, Mode::Settings);
     }
 
     #[test]
@@ -953,5 +1522,150 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/herdr-test-integration"),
             state,
         }
+    }
+    #[test]
+    fn settings_usage_rows_toggle_table_sidebar_and_alerts() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::PaneLabels);
+        let first = PaneHeaderField::ALL.len();
+        for (offset, switch) in UsageSwitch::ALL.iter().copied().enumerate() {
+            state.settings.list.selected = first + offset;
+            let action = update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            );
+            assert_eq!(
+                action,
+                Some(SettingsAction::SaveUsageSwitch(
+                    switch,
+                    !switch.enabled(&state.usage_config)
+                )),
+                "{switch:?}"
+            );
+        }
+        // The list stops after the last usage row.
+        state.settings.list.selected = first + UsageSwitch::ALL.len() - 1;
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            state.settings.list.selected,
+            first + UsageSwitch::ALL.len() - 1
+        );
+        // With the table off, Enter turns it back on.
+        state.usage_config.table = false;
+        state.settings.list.selected = first;
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveUsageSwitch(UsageSwitch::Table, true))
+        );
+    }
+
+    #[test]
+    fn settings_mouse_click_toggles_a_usage_row() {
+        let mut app = app_for_mouse_test();
+        app.state.view.terminal_area = Rect::new(0, 1, 106, 29);
+        open_settings_at(&mut app.state, SettingsSection::PaneLabels);
+        let row = (PaneHeaderField::ALL.len() + 1) as u16;
+        let area = app.state.settings_content_rect();
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 2,
+            area.y + 3 + row,
+        ));
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveUsageSwitch(UsageSwitch::Sidebar, false))
+        );
+    }
+    /// A tester app whose screen is `width` x `height`, with settings open on
+    /// the pane labels section.
+    fn small_screen_settings(width: u16, height: u16) -> App {
+        let mut app = app_for_mouse_test();
+        // The screen is the union of the bands, so leave only one.
+        app.state.view.terminal_area = Rect::new(0, 0, width, height);
+        app.state.view.sidebar_rect = Rect::default();
+        app.state.view.composer.area = Rect::default();
+        app.state.view.agent_table.area = Rect::default();
+        app.state.view.mobile_header_rect = Rect::default();
+        open_settings_at(&mut app.state, SettingsSection::PaneLabels);
+        app
+    }
+
+    #[test]
+    fn every_pane_label_row_is_visible_reachable_and_clickable_on_small_screens() {
+        let total = PaneHeaderField::ALL.len() + UsageSwitch::ALL.len();
+        for (width, height) in [(80u16, 24u16), (80, 20), (80, 16)] {
+            let mut app = small_screen_settings(width, height);
+            let area = app.state.settings_content_rect();
+            assert!(area.height > crate::ui::PANE_LABELS_LIST_OFFSET, "{height}");
+            let mut seen = vec![false; total];
+            for selected in 0..total {
+                app.state.settings.list.selected = selected;
+                let area = app.state.settings_content_rect();
+                let (visible, scroll) = crate::ui::pane_labels_window(area.height, selected);
+                // The selected row is one of the rows drawn.
+                assert!(
+                    (scroll..scroll + visible).contains(&selected),
+                    "{width}x{height}: row {selected} not in {scroll}..{}",
+                    scroll + visible
+                );
+                // The drawn rows end inside the content, above the footer.
+                assert!(
+                    area.y + crate::ui::PANE_LABELS_LIST_OFFSET + visible as u16
+                        <= area.y + area.height
+                );
+                // Every drawn row answers a click with its own index.
+                for slot in 0..visible {
+                    let y = area.y + crate::ui::PANE_LABELS_LIST_OFFSET + slot as u16;
+                    assert_eq!(
+                        app.state.settings_list_index_at(area.x + 2, y),
+                        Some(scroll + slot),
+                        "{width}x{height}, selected {selected}, slot {slot}"
+                    );
+                    seen[scroll + slot] = true;
+                }
+                // Nothing below the list is a row.
+                let below = area.y + crate::ui::PANE_LABELS_LIST_OFFSET + visible as u16;
+                if below < area.y + area.height {
+                    assert_eq!(app.state.settings_list_index_at(area.x + 2, below), None);
+                }
+            }
+            assert!(seen.iter().all(|s| *s), "{width}x{height}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn keyboard_reaches_the_last_usage_row_at_80_by_24_and_a_click_toggles_it() {
+        let mut app = small_screen_settings(80, 24);
+        let total = PaneHeaderField::ALL.len() + UsageSwitch::ALL.len();
+        for _ in 0..total + 3 {
+            update_settings_state(
+                &mut app.state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(app.state.settings.list.selected, total - 1);
+        let area = app.state.settings_content_rect();
+        let (visible, scroll) = crate::ui::pane_labels_window(area.height, total - 1);
+        assert_eq!(scroll + visible, total, "the last row is drawn");
+        let y = area.y + crate::ui::PANE_LABELS_LIST_OFFSET + (visible - 1) as u16;
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 2,
+            y,
+        ));
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveUsageSwitch(
+                UsageSwitch::CursorLogin,
+                true
+            ))
+        );
     }
 }

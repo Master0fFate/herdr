@@ -119,6 +119,9 @@ pub struct Workspace {
     pub id: String,
     /// User-provided override. If set, auto-derived identity stops updating.
     pub custom_name: Option<String>,
+    /// What the space is for, in the user's words. Written when the space is
+    /// made and edited from its menu; shown when the pointer rests on its card.
+    pub purpose: Option<String>,
     /// Fallback workspace identity source for tests, old snapshots, or missing runtimes.
     pub identity_cwd: PathBuf,
     /// Cached current git branch for the workspace repo.
@@ -263,6 +266,7 @@ impl Workspace {
             Self {
                 id: generate_workspace_id(),
                 custom_name: None,
+                purpose: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
@@ -295,8 +299,8 @@ impl Workspace {
     pub fn active_tab_mut(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active_tab)
     }
-    /// Switching to a tab shows its agents; it does not acknowledge them. The
-    /// done marker comes off when it is clicked, and nowhere else.
+    /// Switching tabs changes layout focus only. AppState applies the optional
+    /// acknowledge-on-focus preference at the end of a navigation action.
     pub fn switch_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
             self.active_tab = idx;
@@ -395,8 +399,39 @@ impl Workspace {
         }
         true
     }
+
+    pub fn move_tab(&mut self, source_idx: usize, insert_idx: usize) -> bool {
+        if source_idx >= self.tabs.len() || insert_idx > self.tabs.len() {
+            return false;
+        }
+
+        let target_idx = if source_idx < insert_idx {
+            insert_idx.saturating_sub(1)
+        } else {
+            insert_idx
+        }
+        .min(self.tabs.len().saturating_sub(1));
+
+        if source_idx == target_idx {
+            return false;
+        }
+
+        let active_root_pane = self.tabs.get(self.active_tab).map(|tab| tab.root_pane);
+        let tab = self.tabs.remove(source_idx);
+        self.tabs.insert(target_idx, tab);
+        self.renumber_tabs();
+        self.active_tab = active_root_pane
+            .and_then(|root_pane| self.tabs.iter().position(|tab| tab.root_pane == root_pane))
+            .unwrap_or(target_idx);
+        true
+    }
+
     pub fn close_active_tab(&mut self) -> bool {
         self.close_tab(self.active_tab)
+    }
+
+    pub fn active_tab_display_name(&self) -> Option<String> {
+        self.active_tab().map(|tab| tab.display_name())
     }
 
     pub fn split_focused_with_placement(
@@ -626,6 +661,13 @@ impl Workspace {
         self.custom_name = Some(name);
     }
 
+    /// Set the purpose, trimmed. Blank text clears it: a purpose of nothing is
+    /// no purpose, and would otherwise show an empty fly-out.
+    pub fn set_purpose(&mut self, purpose: &str) {
+        let purpose = purpose.trim();
+        self.purpose = (!purpose.is_empty()).then(|| purpose.to_string());
+    }
+
     pub fn resolved_identity_cwd(&self) -> Option<PathBuf> {
         Some(self.identity_cwd.clone())
     }
@@ -801,13 +843,51 @@ impl Workspace {
 
     pub fn take_pane(&mut self, pane_id: PaneId) -> Option<(PaneId, PaneState)> {
         let tab_idx = self.find_tab_index_for_pane(pane_id)?;
-        let tab = self.tabs.get_mut(tab_idx)?;
-        if tab.zoomed || tab.layout.pane_count() <= 1 {
+        if self.tabs.get(tab_idx)?.zoomed {
             return None;
         }
-        let detached = tab.take_pane(pane_id)?;
-        self.unregister_pane(detached.0);
-        Some(detached)
+        if self.tabs[tab_idx].layout.pane_count() > 1 {
+            let detached = self.tabs.get_mut(tab_idx)?.take_pane(pane_id)?;
+            self.unregister_pane(detached.0);
+            return Some(detached);
+        }
+        let pane = self.tabs[tab_idx].panes.remove(&pane_id)?;
+        self.unregister_pane(pane_id);
+        #[cfg(test)]
+        self.test_runtimes.remove(&pane_id);
+        if self.tabs.len() > 1 {
+            self.tabs.remove(tab_idx);
+            self.renumber_tabs();
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            } else if tab_idx <= self.active_tab && self.active_tab > 0 {
+                self.active_tab -= 1;
+            }
+        }
+        Some((pane_id, pane))
+    }
+
+    pub fn is_vacant(&self) -> bool {
+        self.tabs.iter().all(|tab| tab.panes.is_empty())
+    }
+
+    pub fn restore_taken_pane(&mut self, pane_id: PaneId, pane: PaneState) {
+        if let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.layout.pane_ids().contains(&pane_id) || tab.panes.is_empty())
+        {
+            tab.panes.insert(pane_id, pane);
+            self.register_new_pane(pane_id);
+            return;
+        }
+        if let Some(anchor) = self.focused_pane_id() {
+            let _ = self.dock_detached_at_edge(
+                anchor,
+                crate::layout::SplitSide::Right,
+                (pane_id, pane),
+            );
+        }
     }
 
     /// Build a workspace whose single root pane keeps an existing PaneId/terminal.
@@ -824,6 +904,8 @@ impl Workspace {
         panes.insert(pane_id, pane_state);
         let tab = Tab {
             custom_name: None,
+            goal: None,
+            layout_preview_hidden: false,
             number: 1,
             root_pane: pane_id,
             layout,
@@ -840,6 +922,7 @@ impl Workspace {
         Self {
             id: generate_workspace_id(),
             custom_name: None,
+            purpose: None,
             identity_cwd: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
@@ -899,6 +982,8 @@ impl Workspace {
         panes.insert(root_id, PaneState::new(terminal_id));
         let tab = Tab {
             custom_name: None,
+            goal: None,
+            layout_preview_hidden: false,
             number: 1,
             root_pane: root_id,
             layout,
@@ -914,6 +999,7 @@ impl Workspace {
         Self {
             id: generate_workspace_id(),
             custom_name: Some(name.to_string()),
+            purpose: None,
             identity_cwd: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
@@ -955,6 +1041,8 @@ impl Workspace {
         panes.insert(root_id, PaneState::new(TerminalId::alloc()));
         let tab = Tab {
             custom_name: name.map(str::to_string),
+            goal: None,
+            layout_preview_hidden: false,
             number: self.tabs.len() + 1,
             root_pane: root_id,
             layout,

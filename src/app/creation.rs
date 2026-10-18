@@ -4,6 +4,7 @@ use tracing::error;
 
 use super::{
     api_helpers::{pane_agent_status, tab_attention_priority},
+    state::{DescribeDialogState, DescribeField, DescribeTarget},
     App, Mode,
 };
 use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
@@ -55,20 +56,56 @@ impl App {
         })
     }
 
-    /// Create a workspace with a real PTY (needs event_tx).
-    pub(crate) fn create_workspace(&mut self) {
+    /// Ask what a new space is for and where it starts. The directory begins
+    /// at the folder the space would have been made in without asking.
+    pub(crate) fn open_new_describe_dialog(&mut self) {
         let follow_cwd = self
             .workspace_creation_source()
             .and_then(|ws_idx| self.seed_cwd_from_workspace(ws_idx));
         let initial_cwd = self.resolve_new_terminal_cwd(follow_cwd);
-        if let Err(e) = self.create_workspace_with_options(initial_cwd, true) {
-            error!(err = %e, "failed to create workspace");
-            self.state.mode = Mode::Navigate;
+        self.state.refresh_composer_folders(&self.terminal_runtimes);
+        let mut folders = self.state.composer.clone();
+        folders.close_dropdown();
+        folders.add_folder(initial_cwd.canonicalize().unwrap_or(initial_cwd));
+        let mut dialog = DescribeDialogState::new(DescribeTarget::NewSpace);
+        dialog.folders = Some(folders);
+        self.state.describe_dialog = Some(dialog);
+        self.state.hovered_space = None;
+        self.state.mode = Mode::DescribeDialog;
+    }
+
+    /// Make the space the dialog describes, then close the dialog.
+    pub(crate) fn create_space_from_dialog(&mut self) {
+        let Some(dialog) = self.state.describe_dialog.as_mut() else {
+            return;
+        };
+        let Some(cwd) = dialog
+            .folders
+            .as_ref()
+            .and_then(|folders| folders.folder_path())
+            .map(PathBuf::from)
+        else {
+            dialog.error = Some("choose a directory first".to_string());
+            dialog.field = DescribeField::Directory;
+            return;
+        };
+        let purpose = dialog.text.text();
+        self.state.describe_dialog = None;
+        match self.create_workspace_with_options(cwd, true) {
+            Ok(ws_idx) => {
+                self.state.workspaces[ws_idx].set_purpose(&purpose);
+                self.schedule_session_save();
+            }
+            Err(e) => {
+                error!(err = %e, "failed to create workspace");
+                self.state.mode = Mode::Navigate;
+            }
         }
     }
 
     pub(crate) fn create_tab(&mut self) {
         let custom_name = self.state.requested_new_tab_name.take();
+        let goal = self.state.requested_new_tab_goal.take();
         let follow_cwd = self
             .state
             .active
@@ -76,17 +113,20 @@ impl App {
         let initial_cwd = self.resolve_new_terminal_cwd(follow_cwd);
         match self.create_tab_with_options(initial_cwd, true) {
             Ok(tab_idx) => {
-                if let Some(name) = custom_name {
-                    if let Some(ws) = self
-                        .state
-                        .active
-                        .and_then(|ws_idx| self.state.workspaces.get_mut(ws_idx))
-                    {
-                        if let Some(tab) = ws.tabs.get_mut(tab_idx) {
-                            tab.set_custom_name(name);
-                        }
-                        self.schedule_session_save();
+                if custom_name.is_none() && goal.is_none() {
+                    return;
+                }
+                if let Some(tab) = self
+                    .state
+                    .active
+                    .and_then(|ws_idx| self.state.workspaces.get_mut(ws_idx))
+                    .and_then(|ws| ws.tabs.get_mut(tab_idx))
+                {
+                    if let Some(name) = custom_name {
+                        tab.set_custom_name(name);
                     }
+                    tab.set_goal(goal.as_deref().unwrap_or_default());
+                    self.schedule_session_save();
                 }
             }
             Err(e) => {

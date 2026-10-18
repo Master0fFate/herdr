@@ -1,0 +1,1418 @@
+use super::*;
+use serde_json::json;
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
+
+fn directory() -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "herdr-usage-tests-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("test dir");
+    dir
+}
+pub(super) fn config() -> UsageConfig {
+    let dir = directory();
+    UsageConfig {
+        codex_home: dir.join("codex"),
+        claude_state_file: dir.join("claude.json"),
+        snapshot_file: dir.join("usage.json"),
+        fixture: None,
+        ..UsageConfig::default()
+    }
+}
+fn sample(name: &str) -> String {
+    fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/usage")
+            .join(name),
+    )
+    .expect("fixture")
+}
+fn log(config: &UsageConfig, name: &str, data: &str) -> PathBuf {
+    let dir = config
+        .codex_home
+        .join("sessions")
+        .join(local_time(1, c"%Y/%m/%d"));
+    fs::create_dir_all(&dir).expect("log dir");
+    let path = dir.join(name);
+    fs::write(&path, data).expect("log");
+    path
+}
+fn event(time: &str, used: Value, reset: u64) -> String {
+    format!(
+        "{}\n",
+        json!({"timestamp":time,"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":used,"resets_at":reset},"secondary":{"used_percent":5,"resets_at":reset+600000}}}})
+    )
+}
+#[test]
+fn codex_synthetic_samples() {
+    for name in ["normal", "high-use", "after-reset", "other-limit-id"] {
+        let c = config();
+        let data = sample(&format!("codex-token-count-{name}.jsonl"));
+        log(&c, "rollout.jsonl", &data);
+        let actual = codex::read(&c.codex_home, 1);
+        if name == "other-limit-id" {
+            assert_eq!(actual.problem, Some(UsageProblem::NoData));
+            log(
+                &c,
+                "mixed.jsonl",
+                &format!("{}{}", sample("codex-token-count-normal.jsonl"), data),
+            );
+            assert_eq!(codex::read(&c.codex_home, 1).problem, None);
+            continue;
+        }
+        let expected: Value = data
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|v| {
+                v.pointer("/payload/rate_limits/limit_id")
+                    .and_then(Value::as_str)
+                    == Some("codex")
+            })
+            .max_by_key(|v| v["timestamp"].as_str().unwrap_or("").to_owned())
+            .expect("codex event");
+        assert_eq!(actual.problem, None, "{name}");
+        assert_eq!(
+            actual.windows[0].left_pct,
+            percent(&expected["payload"]["rate_limits"]["primary"]["used_percent"])
+        );
+        assert_eq!(
+            actual.seen_at,
+            expected["timestamp"].as_str().and_then(timestamp)
+        );
+    }
+}
+#[test]
+fn newest_line_wins_and_reset_is_idle() {
+    let c = config();
+    log(
+        &c,
+        "older-file.jsonl",
+        &event("2026-10-14T15:00:00Z", json!(90), 10),
+    );
+    log(
+        &c,
+        "newer-file.jsonl",
+        &event("2026-10-14T14:00:00Z", json!(20), 9999999999),
+    );
+    let p = codex::read(&c.codex_home, 20);
+    assert_eq!(p.windows[0].left_pct, Some(10));
+    assert!(p.windows[0].reset);
+    assert_eq!(p.windows[0].resets_at, Some(10));
+    assert_eq!(p.seen_at, timestamp("2026-10-14T15:00:00Z"));
+    let mut published = UsageSnapshot {
+        version: 1,
+        taken_at: 20,
+        providers: vec![p],
+    };
+    UsageState::new(config()).save_snapshot(&mut published);
+    assert_eq!(published.providers[0].windows[0].left_pct, Some(10));
+    assert!(published.providers[0].windows[0].reset);
+    let published_json = serde_json::to_value(&published).expect("json");
+    assert_eq!(published_json["providers"][0]["windows"][0]["left_pct"], 10);
+    assert_eq!(published_json["providers"][0]["windows"][0]["reset"], true);
+}
+#[test]
+fn codex_bounded_tail_widens_and_ignores_partial_lines() {
+    let c = config();
+    let data = format!(
+        "{}{}\n{{broken",
+        event("2026-10-14T15:00:00Z", json!(12.5), 9999999999),
+        "x".repeat(70000)
+    );
+    let path = log(&c, "log.jsonl", &data);
+    assert_eq!(codex::read(&c.codex_home, 1).windows[0].left_pct, Some(87));
+    fs::write(
+        path,
+        format!(
+            "{}{}",
+            event("2026-10-14T15:00:00Z", json!(12), 9999999999),
+            "x".repeat(300000)
+        ),
+    )
+    .expect("huge");
+    assert_eq!(
+        codex::read(&c.codex_home, 1).problem,
+        Some(UsageProblem::NoData)
+    );
+}
+#[test]
+fn codex_odd_and_missing_files() {
+    let c = config();
+    assert_eq!(
+        codex::read(&c.codex_home, 1).problem,
+        Some(UsageProblem::NoData)
+    );
+    for data in ["", "not json", "{\"type\":", "{\"rate_limits\":null}"] {
+        log(&c, "log.jsonl", data);
+        assert_eq!(
+            codex::read(&c.codex_home, 1).problem,
+            Some(UsageProblem::NoData)
+        );
+    }
+    log(
+        &c,
+        "log.jsonl",
+        &event("2026-10-14T15:00:00Z", json!("90"), 9999999999),
+    );
+    assert_eq!(
+        codex::read(&c.codex_home, 1).problem,
+        Some(UsageProblem::FormatChanged)
+    );
+    let path = c
+        .codex_home
+        .join("sessions")
+        .join(local_time(1, c"%Y/%m/%d"))
+        .join("directory.jsonl");
+    fs::create_dir_all(path).expect("unreadable file substitute");
+    assert!(codex::read(&c.codex_home, 1).windows[0].left_pct.is_none());
+}
+#[test]
+fn codex_reads_at_most_five_newest_files() {
+    let c = config();
+    log(
+        &c,
+        "valid.jsonl",
+        &event("2026-10-14T15:00:00Z", json!(90), 9999999999),
+    );
+    for n in 0..5 {
+        log(&c, &format!("new{n}.jsonl"), "no events");
+    }
+    assert_eq!(
+        codex::read(&c.codex_home, 1).problem,
+        Some(UsageProblem::NoData)
+    );
+}
+#[test]
+fn claude_samples_before_and_after_turn() {
+    for n in 1..=2 {
+        let c = config();
+        let input = sample(&format!("claude-statusline-input-redacted-{n}.json"));
+        let mut out = Vec::new();
+        statusline::run(&c, input.as_bytes(), &mut out, 100).expect("statusline");
+        let actual = claude::read(&c.claude_state_file, 100);
+        if n == 1 {
+            assert!(!c.claude_state_file.exists());
+            assert_eq!(actual.problem, Some(UsageProblem::NoData));
+        } else {
+            assert_eq!(actual.problem, None);
+            assert_eq!(actual.windows[0].left_pct, Some(80));
+            assert_eq!(actual.windows[1].left_pct, Some(97));
+        }
+        assert_eq!(String::from_utf8(out).expect("utf8").lines().count(), 1);
+    }
+}
+#[test]
+fn claude_optional_malformed_and_expired() {
+    let c = config();
+    for value in [
+        json!({"seen_at":10}),
+        json!({"seen_at":10,"seven_day":{"used_percentage":30,"resets_at":1}}),
+        json!({"seen_at":10,"five_hour":null}),
+    ] {
+        atomic_json(&c.claude_state_file, &value).expect("save");
+        let actual = claude::read(&c.claude_state_file, 10);
+        if value.get("five_hour").is_some() {
+            assert_eq!(actual.problem, Some(UsageProblem::FormatChanged));
+        } else if value.get("seven_day").is_some() {
+            assert_eq!(actual.windows[1].left_pct, Some(70));
+            assert!(actual.windows[1].reset);
+            assert_eq!(actual.windows[0].left_pct, None);
+        } else {
+            assert_eq!(actual.problem, Some(UsageProblem::NoData));
+        }
+    }
+    for bytes in ["", "{", "null", "[]", "not json"] {
+        fs::write(&c.claude_state_file, bytes).expect("write");
+        assert_eq!(
+            claude::read(&c.claude_state_file, 10).problem,
+            Some(UsageProblem::FormatChanged)
+        );
+    }
+}
+#[test]
+fn statusline_keeps_newer_even_with_concurrent_writers() {
+    let c = config();
+    std::thread::scope(|scope| {
+        for time in 1..=20 {
+            let path = &c.claude_state_file;
+            scope.spawn(move || {
+                statusline::save_newer(path, &json!({"seen_at":time})).expect("save");
+            });
+        }
+    });
+    assert_eq!(
+        read_json::<Value>(&c.claude_state_file).expect("state")["seen_at"],
+        20
+    );
+    statusline::save_newer(&c.claude_state_file, &json!({"seen_at":20,"five_hour":{}}))
+        .expect("equal");
+    assert!(read_json::<Value>(&c.claude_state_file)
+        .expect("state")
+        .get("five_hour")
+        .is_none());
+}
+fn stale_reading(c: &UsageConfig, seen: u64, key: &str, used: u64, resets: u64) {
+    statusline::save_newer(
+        &c.claude_state_file,
+        &json!({"seen_at": seen, key: {"used_percentage": used, "resets_at": resets}}),
+    )
+    .expect("save");
+}
+#[test]
+fn statusline_idle_pane_cannot_lower_a_window_and_resets_follow_resets_at() {
+    for key in ["five_hour", "seven_day"] {
+        let c = config();
+        let saved = || read_json::<Value>(&c.claude_state_file).expect("state");
+        stale_reading(&c, 10, key, 26, 2_000);
+        // idle pane: newer seen_at, older numbers, same window
+        stale_reading(&c, 20, key, 9, 2_000);
+        assert_eq!(saved()[key]["used_percentage"], 26);
+        assert_eq!(saved()["seen_at"], 20);
+        // a real increase in the same window is kept
+        stale_reading(&c, 30, key, 40, 2_000);
+        assert_eq!(saved()[key]["used_percentage"], 40);
+        // an earlier reset time is an old window and is ignored
+        stale_reading(&c, 40, key, 99, 1_000);
+        assert_eq!(saved()[key]["used_percentage"], 40);
+        assert_eq!(saved()[key]["resets_at"], 2_000);
+        // a later reset time is a real reset, even with a low number
+        stale_reading(&c, 50, key, 3, 9_000);
+        assert_eq!(saved()[key]["used_percentage"], 3);
+        assert_eq!(saved()[key]["resets_at"], 9_000);
+    }
+}
+#[test]
+fn statusline_run_keeps_the_fresh_reading_when_an_idle_pane_redraws() {
+    let c = config();
+    let mut out = Vec::new();
+    let input = |used: u64| {
+        format!(
+            r#"{{"rate_limits":{{"five_hour":{{"used_percentage":{used},"resets_at":2000000000}}}}}}"#
+        )
+    };
+    statusline::run(&c, input(26).as_bytes(), &mut out, 100).expect("fresh");
+    out.clear();
+    statusline::run(&c, input(9).as_bytes(), &mut out, 200).expect("idle");
+    let saved = read_json::<Value>(&c.claude_state_file).expect("state");
+    assert_eq!(saved["five_hour"]["used_percentage"], 26);
+}
+fn session_reading(
+    c: &UsageConfig,
+    seen: u64,
+    who: (&str, u64),
+    key: &str,
+    used: u64,
+    resets: u64,
+) {
+    statusline::save_newer(
+        &c.claude_state_file,
+        &json!({
+            "seen_at": seen,
+            "session": {"id": who.0, "marker": who.1},
+            key: {"used_percentage": used, "resets_at": resets}
+        }),
+    )
+    .expect("save");
+}
+#[test]
+fn statusline_a_new_response_can_lower_a_window_but_a_redraw_cannot() {
+    for key in ["five_hour", "seven_day"] {
+        let c = config();
+        let saved = || read_json::<Value>(&c.claude_state_file).expect("state");
+        let used = || saved()[key]["used_percentage"].clone();
+        // first sight of two sessions: nothing known, numbers can only go up
+        session_reading(&c, 10, ("a", 100), key, 100, 2_000);
+        session_reading(&c, 11, ("b", 50), key, 60, 2_000);
+        assert_eq!(used(), 100);
+        // session a answers again, so its reading is new: a manual full reset shows
+        session_reading(&c, 20, ("a", 200), key, 0, 2_000);
+        assert_eq!(used(), 0);
+        assert_eq!(saved()[key]["resets_at"], 2_000);
+        // session b only redraws the response it had (same marker): ignored
+        session_reading(&c, 30, ("b", 50), key, 100, 2_000);
+        assert_eq!(used(), 0);
+        // session a redraws its last response: ignored too
+        session_reading(&c, 40, ("a", 200), key, 55, 2_000);
+        assert_eq!(used(), 0);
+        // a new response from b is accepted, also when higher
+        session_reading(&c, 50, ("b", 90), key, 7, 2_000);
+        assert_eq!(used(), 7);
+        // an earlier reset time is ignored even for a new response; a later one replaces
+        session_reading(&c, 60, ("a", 300), key, 80, 1_000);
+        assert_eq!(used(), 7);
+        session_reading(&c, 70, ("a", 400), key, 2, 9_000);
+        assert_eq!(used(), 2);
+        assert_eq!(saved()[key]["resets_at"], 9_000);
+        // the markers are remembered even when the numbers were ignored
+        assert_eq!(saved()["sessions"]["a"]["marker"], 400);
+        assert_eq!(saved()["sessions"]["b"]["marker"], 90);
+        assert!(saved().get("session").is_none());
+    }
+}
+#[test]
+fn statusline_run_reads_the_session_and_api_time_from_the_input() {
+    let c = config();
+    let mut out = Vec::new();
+    let input = |used: u64, api_ms: u64| {
+        format!(
+            r#"{{"session_id":"s1","cost":{{"total_api_duration_ms":{api_ms}}},"rate_limits":{{"seven_day":{{"used_percentage":{used},"resets_at":2000000000}}}}}}"#
+        )
+    };
+    let used = || {
+        read_json::<Value>(&c.claude_state_file).expect("state")["seven_day"]["used_percentage"]
+            .clone()
+    };
+    statusline::run(&c, input(100, 5_000).as_bytes(), &mut out, 100).expect("first");
+    // an idle redraw with a lower number and a newer time changes nothing
+    statusline::run(&c, input(9, 5_000).as_bytes(), &mut out, 200).expect("idle");
+    assert_eq!(used(), 100);
+    // after the first call the session is known, so a new response shows a real drop
+    statusline::run(&c, input(0, 9_000).as_bytes(), &mut out, 300).expect("reset");
+    assert_eq!(used(), 0);
+    assert_eq!(
+        read_json::<Value>(&c.claude_state_file).expect("state")["sessions"]["s1"]["marker"],
+        9_000
+    );
+}
+#[test]
+fn cursor_sample_missing_unlimited_and_idle() {
+    let value: Value =
+        serde_json::from_str(&sample("cursor-usage-summary.sample.json")).expect("sample");
+    let p = cursor::parse(&value, 1);
+    assert_eq!(p.problem, None);
+    assert_eq!(p.windows.len(), 2);
+    assert_eq!(p.windows[0].kind, WindowKind::Auto);
+    assert_eq!(p.windows[1].kind, WindowKind::Named);
+    assert_eq!(p.windows[0].left_pct, Some(80));
+    assert_eq!(p.windows[1].left_pct, Some(99));
+    assert_eq!(p.windows[0].resets_at, p.windows[1].resets_at);
+    assert!(p.windows[0]
+        .note
+        .as_ref()
+        .expect("note")
+        .contains("overall 82% left, auto 80% left, named 99% left"));
+    let idle = cursor::parse(&value, u64::MAX);
+    assert_eq!(idle.windows[0].left_pct, Some(80));
+    assert_eq!(idle.windows[1].left_pct, Some(99));
+    assert!(idle.windows[0].reset && idle.windows[1].reset);
+    let idle_json = serde_json::to_value(&idle).expect("json");
+    assert_eq!(idle_json["windows"][0]["left_pct"], 80);
+    assert_eq!(idle_json["windows"][0]["reset"], true);
+    assert_eq!(idle_json["windows"][0]["kind"], "auto");
+    assert_eq!(idle_json["windows"][1]["kind"], "named");
+    let mut published = UsageSnapshot {
+        version: 1,
+        taken_at: u64::MAX,
+        providers: vec![idle.clone()],
+    };
+    UsageState::new(config()).save_snapshot(&mut published);
+    assert_eq!(published.providers[0].windows[0].left_pct, Some(80));
+    assert_eq!(published.providers[0].windows[1].left_pct, Some(99));
+    assert!(published.providers[0].windows[0].reset);
+    let published_json = serde_json::to_value(&published).expect("json");
+    assert_eq!(published_json["providers"][0]["windows"][0]["left_pct"], 80);
+    assert_eq!(published_json["providers"][0]["windows"][0]["reset"], true);
+    let mut single = value.clone();
+    single["individualUsage"]["plan"]
+        .as_object_mut()
+        .expect("plan")
+        .remove("autoPercentUsed");
+    let named_only = cursor::parse(&single, 1);
+    assert_eq!(named_only.windows[0].left_pct, None);
+    assert_eq!(named_only.windows[1].left_pct, Some(99));
+    assert_eq!(named_only.problem, None);
+    single["individualUsage"]["plan"]
+        .as_object_mut()
+        .expect("plan")
+        .remove("apiPercentUsed");
+    assert_eq!(
+        cursor::parse(&single, 1).problem,
+        Some(UsageProblem::FormatChanged)
+    );
+    single["isUnlimited"] = json!(true);
+    assert_eq!(cursor::parse(&single, 1).windows[0].left_pct, None);
+    assert_eq!(cursor::parse(&single, 1).problem, None);
+    assert_eq!(
+        cursor::parse(&json!({"error":"not_authenticated"}), 1).problem,
+        Some(UsageProblem::LoginExpired)
+    );
+}
+#[test]
+fn cursor_pools_alert_and_recover_on_their_own() {
+    let mut value: Value =
+        serde_json::from_str(&sample("cursor-usage-summary.sample.json")).expect("sample");
+    let set = |value: &mut Value, auto: f64, named: f64| {
+        let plan = value["individualUsage"]["plan"].as_object_mut().unwrap();
+        plan.insert("autoPercentUsed".into(), json!(auto));
+        plan.insert("apiPercentUsed".into(), json!(named));
+    };
+    let snap = |provider: ProviderUsage, taken: u64| UsageSnapshot {
+        version: 1,
+        taken_at: taken,
+        providers: vec![provider],
+    };
+    set(&mut value, 92.0, 40.0);
+    let low = cursor::parse(&value, 1_000);
+    assert_eq!(low.windows[0].left_pct, Some(8));
+    assert_eq!(low.windows[1].left_pct, Some(60));
+    let mut state = UsageState::new(config());
+    assert_eq!(
+        state.take_alerts(&snap(low, 1_000)),
+        vec![(Provider::Cursor, WindowKind::Auto)]
+    );
+    set(&mut value, 20.0, 40.0);
+    let back = state.take_recoveries(&snap(cursor::parse(&value, 1_100), 1_100), 1_100);
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].kind, WindowKind::Auto);
+    assert!(!back[0].reset);
+    assert_eq!(back[0].left_pct, 80);
+    set(&mut value, 10.0, 95.0);
+    let named_low = cursor::parse(&value, 1_200);
+    assert_eq!(named_low.windows[1].left_pct, Some(5));
+    assert_eq!(
+        state.take_alerts(&snap(named_low, 1_200)),
+        vec![(Provider::Cursor, WindowKind::Named)]
+    );
+    let spoken = state.take_recoveries(&snap(cursor::parse(&value, u64::MAX), u64::MAX), u64::MAX);
+    assert_eq!(spoken.len(), 1);
+    assert_eq!(spoken[0].kind, WindowKind::Named);
+    assert!(spoken[0].reset);
+}
+#[test]
+fn fixture_refresh_and_alert_jitter() {
+    let mut c = config();
+    let mut p = unknown(Provider::Codex, UsageProblem::NoData);
+    p.problem = None;
+    p.windows[0].left_pct = Some(10);
+    p.windows[0].resets_at = Some(5000);
+    let mut snap = UsageSnapshot {
+        version: 1,
+        taken_at: 1,
+        providers: vec![p],
+    };
+    let path = c.snapshot_file.with_extension("fixture");
+    atomic_json(&path, &snap).expect("fixture");
+    c.fixture = Some(path);
+    let mut state = UsageState::new(c);
+    assert_eq!(state.refresh(&[Provider::Cursor], 100), snap);
+    assert_eq!(
+        state.take_alerts(&snap),
+        vec![(Provider::Codex, WindowKind::FiveHour)]
+    );
+    assert!(state.take_alerts(&snap).is_empty());
+    snap.providers[0].windows[0].resets_at = Some(5002);
+    assert!(state.take_alerts(&snap).is_empty());
+    snap.providers[0].windows[0].resets_at = Some(23000);
+    assert_eq!(state.take_alerts(&snap).len(), 1);
+    snap.taken_at = 24000;
+    assert!(state.take_alerts(&snap).is_empty());
+}
+fn codex_window(left: u8, resets: u64, taken: u64) -> UsageSnapshot {
+    let mut provider = unknown(Provider::Codex, UsageProblem::NoData);
+    provider.problem = None;
+    provider.windows[0].left_pct = Some(left);
+    provider.windows[0].resets_at = Some(resets);
+    UsageSnapshot {
+        version: 1,
+        taken_at: taken,
+        providers: vec![provider],
+    }
+}
+#[test]
+fn recovery_fires_once_on_reset_and_not_for_a_window_that_was_never_low() {
+    let mut state = UsageState::new(config());
+    let never_low = codex_window(80, 5_000, 1);
+    assert!(state.take_recoveries(&never_low, 1).is_empty());
+    let already_reset = codex_window(5, 100, 500);
+    assert!(state.take_alerts(&already_reset).is_empty());
+    assert!(state.take_recoveries(&already_reset, 500).is_empty());
+
+    let low = codex_window(10, 5_000, 1);
+    assert_eq!(
+        state.take_alerts(&low),
+        vec![(Provider::Codex, WindowKind::FiveHour)]
+    );
+    assert!(state.take_recoveries(&low, 1).is_empty());
+    assert!(state.take_recoveries(&low, 4_999).is_empty());
+    assert_eq!(
+        state.recovery_wake_secs(&low, 1),
+        Some(5_000 + RESET_WAKE_MARGIN_SECS - 1)
+    );
+    let back = state.take_recoveries(&low, 5_000);
+    assert_eq!(
+        back,
+        vec![AllowanceRecovery {
+            provider: Provider::Codex,
+            kind: WindowKind::FiveHour,
+            left_pct: 100,
+            reset: true,
+        }]
+    );
+    assert!(state.take_recoveries(&low, 5_100).is_empty());
+    assert!(state.recovery_wake_secs(&low, 5_100).is_none());
+}
+#[test]
+fn recovery_fires_once_when_allowance_rises_above_the_threshold() {
+    let mut state = UsageState::new(config());
+    let low = codex_window(9, 9_000, 1);
+    assert_eq!(state.take_alerts(&low).len(), 1);
+    let rose = codex_window(40, 9_000, 2);
+    assert_eq!(
+        state.take_recoveries(&rose, 2),
+        vec![AllowanceRecovery {
+            provider: Provider::Codex,
+            kind: WindowKind::FiveHour,
+            left_pct: 40,
+            reset: false,
+        }]
+    );
+    assert!(state.take_recoveries(&rose, 3).is_empty());
+}
+#[test]
+fn recovery_wake_uses_the_margin_the_earliest_reset_and_skips_a_login_problem() {
+    let mut state = UsageState::new(config());
+    let mut snap = codex_window(10, 5_000, 1);
+    snap.providers[0].windows[1].left_pct = Some(8);
+    snap.providers[0].windows[1].resets_at = Some(8_000);
+    assert_eq!(state.take_alerts(&snap).len(), 2);
+    assert_eq!(
+        state.recovery_wake_secs(&snap, 1),
+        Some(5_000 + RESET_WAKE_MARGIN_SECS - 1)
+    );
+    assert_eq!(
+        state.recovery_wake_secs(&snap, 5_000 + RESET_WAKE_MARGIN_SECS),
+        Some(0)
+    );
+    snap.providers[0].problem = Some(UsageProblem::LoginExpired);
+    assert_eq!(state.recovery_wake_secs(&snap, 9_000), None);
+    assert_eq!(state.recovery_wake_secs(&snap, 9_001), None);
+    assert!(state.take_recoveries(&snap, 9_000).is_empty());
+    snap.providers[0].problem = None;
+    let back = state.take_recoveries(&snap, 9_000);
+    assert_eq!(back.len(), 2);
+    assert!(back.iter().all(|item| item.reset && item.left_pct == 100));
+    assert!(state.take_recoveries(&snap, 9_001).is_empty());
+}
+#[test]
+fn refresh_only_wanted_providers_and_snapshot() {
+    let c = config();
+    let path = c.snapshot_file.clone();
+    let mut state = UsageState::new(c);
+    let snap = state.refresh(&[Provider::Claude, Provider::Claude], 100);
+    assert_eq!(snap.providers.len(), 1);
+    assert_eq!(read_json::<UsageSnapshot>(&path).expect("snapshot"), snap);
+    assert_eq!(state.last_cursor_fetch, None);
+}
+#[test]
+fn cursor_cached_polling_and_offline_reading() {
+    let c = config();
+    let mut state = UsageState::new(c);
+    let p = cursor::parse(
+        &serde_json::from_str(&sample("cursor-usage-summary.sample.json")).expect("sample"),
+        1000,
+    );
+    state.cursor_result = Some(p.clone());
+    state.last_cursor_fetch = Some(1000);
+    assert_eq!(state.refresh(&[Provider::Cursor], 1899).providers, vec![p]);
+    assert_eq!(state.last_cursor_fetch, Some(1000));
+    // No live fetch is made by this test.
+}
+#[test]
+fn palette_thresholds_and_percentage_clamping() {
+    assert_eq!(
+        palette::level_rgb(Provider::Codex, WindowKind::Weekly, Some(10)),
+        palette::RED
+    );
+    assert_eq!(
+        palette::level_rgb(Provider::Codex, WindowKind::Weekly, Some(20)),
+        palette::PINK
+    );
+    assert_eq!(percent(&json!(-50)), Some(100));
+    assert_eq!(percent(&json!(200)), Some(0));
+    assert_eq!(timestamp("2026-02-31T00:00:00Z"), None);
+    assert_eq!(timestamp("bad"), None);
+}
+#[test]
+fn refresh_speed_100_runs() {
+    let c = config();
+    log(&c, "log.jsonl", &sample("codex-token-count-normal.jsonl"));
+    let mut output = Vec::new();
+    statusline::run(
+        &c,
+        sample("claude-statusline-input-redacted-2.json").as_bytes(),
+        &mut output,
+        1,
+    )
+    .expect("statusline");
+    let mut state = UsageState::new(c);
+    let mut times = Vec::new();
+    for _ in 0..100 {
+        let start = Instant::now();
+        let snap = state.refresh(&[Provider::Claude, Provider::Codex], 1);
+        assert_eq!(snap.providers.len(), 2);
+        times.push(start.elapsed().as_micros());
+    }
+    times.sort_unstable();
+    println!(
+        "USAGE_REFRESH_100 median_us={} max_us={}",
+        times[50], times[99]
+    );
+}
+
+#[test]
+fn cursor_http_failures_never_guess_login() {
+    assert_eq!(
+        cursor::http_result(401, "", "", 1).problem,
+        Some(UsageProblem::LoginExpired)
+    );
+    assert_eq!(
+        cursor::http_result(
+            307,
+            "https://api.workos.com/user_management/authorize",
+            "",
+            1
+        )
+        .problem,
+        Some(UsageProblem::LoginExpired)
+    );
+    assert_eq!(
+        cursor::http_result(403, "", "", 1).problem,
+        Some(UsageProblem::FormatChanged)
+    );
+    assert_eq!(
+        cursor::http_result(500, "", "", 1).problem,
+        Some(UsageProblem::Offline)
+    );
+    assert_eq!(
+        cursor::http_result(200, "", "broken", 1).problem,
+        Some(UsageProblem::FormatChanged)
+    );
+    assert_eq!(
+        cursor::http_result(200, "", r#"{"error":"not_authenticated"}"#, 1).problem,
+        Some(UsageProblem::LoginExpired)
+    );
+}
+#[test]
+fn cursor_offline_keeps_good_numbers_and_throttles_errors() {
+    let mut c = config();
+    c.cursor_min_interval_secs = 1;
+    let mut state = UsageState::new(c);
+    let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000);
+    assert_eq!(state.refresh_cursor(1000, |_| good.clone()), good);
+    assert_eq!(
+        state.refresh_cursor(1899, |_| panic!("must not fetch early")),
+        good
+    );
+    let offline = state.refresh_cursor(1900, |_| unknown(Provider::Cursor, UsageProblem::Offline));
+    assert_eq!(offline.problem, Some(UsageProblem::Offline));
+    assert_eq!(offline.windows, good.windows);
+    assert_eq!(offline.seen_at, good.seen_at);
+    let _ = state.refresh_cursor(2800, |_| {
+        unknown(Provider::Cursor, UsageProblem::LoginExpired)
+    });
+    let offline = state.refresh_cursor(3700, |_| unknown(Provider::Cursor, UsageProblem::Offline));
+    assert_eq!(offline.problem, Some(UsageProblem::LoginExpired));
+    assert_eq!(offline.windows[0].left_pct, None);
+    assert!(state.cursor_good.is_none());
+}
+#[test]
+fn timestamp_dates_and_fractions() {
+    assert_eq!(timestamp("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(timestamp("2026-11-08T05:21:26.000Z"), Some(1794115286));
+    assert_eq!(timestamp("2000-02-29T00:00:00Z"), Some(951782400));
+    for s in [
+        "2100-02-29T00:00:00Z",
+        "2026-10-14T00:00:00.Z",
+        "2026-13-01T00:00:00Z",
+        "2026-10-14T24:00:00Z",
+        "2026-10-14T00:00:00+00:00",
+    ] {
+        assert_eq!(timestamp(s), None, "{s}");
+    }
+}
+
+#[test]
+fn codex_subsecond_order_and_bad_timestamp() {
+    let c = config();
+    log(
+        &c,
+        "a.jsonl",
+        &event("2026-10-14T15:00:00.950Z", json!(90), 9999999999),
+    );
+    log(
+        &c,
+        "b.jsonl",
+        &event("2026-10-14T15:00:00.100Z", json!(20), 9999999999),
+    );
+    assert_eq!(codex::read(&c.codex_home, 1).windows[0].left_pct, Some(10));
+    let c = config();
+    log(&c, "bad.jsonl", &event("bad", json!(90), 9999999999));
+    assert_eq!(
+        codex::read(&c.codex_home, 1).problem,
+        Some(UsageProblem::FormatChanged)
+    );
+}
+#[test]
+fn codex_unreadable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let c = config();
+    let path = log(
+        &c,
+        "log.jsonl",
+        &event("2026-10-14T15:00:00Z", json!(90), 9999999999),
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).expect("permissions");
+    let result = codex::read(&c.codex_home, 1);
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("restore permissions");
+    assert_eq!(result.problem, Some(UsageProblem::NoData));
+}
+
+#[test]
+fn refresh_live_speed_100_runs() {
+    let mut c = config();
+    c.codex_home = UsageConfig::default().codex_home;
+    let mut output = Vec::new();
+    statusline::run(
+        &c,
+        sample("claude-statusline-input-redacted-2.json").as_bytes(),
+        &mut output,
+        now(),
+    )
+    .expect("statusline");
+    let mut state = UsageState::new(c);
+    let mut times = Vec::new();
+    for _ in 0..100 {
+        let start = Instant::now();
+        let snap = state.refresh(&[Provider::Claude, Provider::Codex], now());
+        assert_eq!(snap.providers.len(), 2);
+        times.push(start.elapsed().as_micros());
+    }
+    times.sort_unstable();
+    println!(
+        "USAGE_LIVE_REFRESH_100 median_us={} max_us={}",
+        times[50], times[99]
+    );
+}
+
+#[test]
+fn codex_empty_today_falls_back_one_folder() {
+    let c = config();
+    fs::create_dir_all(c.codex_home.join("sessions/2026/10/15")).expect("empty today");
+    log(
+        &c,
+        "yesterday.jsonl",
+        &event("2026-10-14T15:00:00Z", json!(32), 9999999999),
+    );
+    let yesterday = c.codex_home.join("sessions/2026/10/14");
+    fs::create_dir_all(&yesterday).expect("yesterday");
+    fs::write(
+        yesterday.join("log.jsonl"),
+        event("2026-10-14T15:00:00Z", json!(32), 9999999999),
+    )
+    .expect("yesterday log");
+    let actual = codex::read(
+        &c.codex_home,
+        timestamp("2026-10-15T15:00:00Z").expect("date"),
+    );
+    assert_eq!(actual.windows[0].left_pct, Some(68));
+}
+
+#[test]
+fn cli_refreshes_each_minute_without_postponing_cursor_fetch() {
+    let c = config();
+    let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000);
+    UsageState::new(c.clone())
+        .refresh_with_cursor_fetch(&[Provider::Cursor], 1000, |_| good.clone());
+    let mut attempts = Vec::new();
+    for minute in 1..=20 {
+        let now = 1000 + minute * 60;
+        let want = cli::wanted_providers(&c, now);
+        let mut state = UsageState::new(c.clone());
+        let snapshot = state.refresh_with_cursor_fetch(&want, now, |_| {
+            attempts.push(now);
+            good.clone()
+        });
+        assert!(snapshot
+            .providers
+            .iter()
+            .any(|p| p.provider == Provider::Cursor));
+        assert_eq!(
+            cursor_fetch_time(&c),
+            Some(if minute < 15 { 1000 } else { 1900 })
+        );
+    }
+    assert_eq!(attempts, vec![1900]);
+}
+#[test]
+fn claude_only_refresh_preserves_cursor_and_fetch_time() {
+    let c = config();
+    let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000);
+    let mut state = UsageState::new(c.clone());
+    state.refresh_with_cursor_fetch(&[Provider::Cursor], 1000, |_| good.clone());
+    let snapshot =
+        state.refresh_with_cursor_fetch(&[Provider::Claude], 1200, |_| panic!("Cursor not wanted"));
+    assert_eq!(
+        snapshot
+            .providers
+            .iter()
+            .find(|p| p.provider == Provider::Cursor),
+        Some(&good)
+    );
+    assert_eq!(
+        read_json::<UsageSnapshot>(&c.snapshot_file).expect("saved"),
+        snapshot
+    );
+    assert_eq!(cursor_fetch_time(&c), Some(1000));
+}
+#[test]
+fn cursor_due_uses_sidecar_and_shared_configured_interval() {
+    let mut c = config();
+    c.cursor_min_interval_secs = 1200;
+    let mut state = UsageState::new(c.clone());
+    state.refresh_with_cursor_fetch(&[Provider::Cursor], 1000, |_| {
+        unknown(Provider::Cursor, UsageProblem::NoLogin)
+    });
+    assert!(!cursor_fetch_due(&c, 2199));
+    assert!(cursor_fetch_due(&c, 2200));
+    assert!(!cli::wanted_providers(&c, 2199).contains(&Provider::Cursor));
+    assert!(cli::wanted_providers(&c, 2200).contains(&Provider::Cursor));
+    let mut reloaded = UsageState::new(c.clone());
+    assert_eq!(reloaded.last_cursor_fetch, Some(1000));
+    reloaded.refresh_cursor(2199, |_| panic!("not due"));
+    reloaded.refresh_cursor(2200, |_| unknown(Provider::Cursor, UsageProblem::NoLogin));
+    assert_eq!(cursor_fetch_time(&c), Some(2200));
+    let absent = config();
+    assert!(cursor_fetch_due(&absent, 1));
+    fs::create_dir_all(cursor_fetch_file(&absent)).expect("unreadable sidecar");
+    assert!(cursor_fetch_due(&absent, 1));
+    assert_eq!(UsageState::new(absent).last_cursor_fetch, None);
+}
+#[test]
+fn login_problems_stick_after_restart_and_offline() {
+    for problem in [UsageProblem::LoginExpired, UsageProblem::NoLogin] {
+        let c = config();
+        let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000);
+        let mut state = UsageState::new(c.clone());
+        state.refresh_with_cursor_fetch(&[Provider::Cursor], 1000, |_| good.clone());
+        state.refresh_with_cursor_fetch(&[Provider::Cursor], 1900, |_| {
+            unknown(Provider::Cursor, problem.clone())
+        });
+        assert!(state.cursor_good.is_none());
+        let mut state = UsageState::new(c);
+        let snap = state.refresh_with_cursor_fetch(&[Provider::Cursor], 2800, |_| {
+            unknown(Provider::Cursor, UsageProblem::Offline)
+        });
+        assert_eq!(snap.providers[0].problem, Some(problem));
+        assert_eq!(snap.providers[0].windows[0].left_pct, None);
+    }
+}
+#[test]
+fn all_providers_floor_fractional_percentages() {
+    let c = config();
+    log(
+        &c,
+        "fraction.jsonl",
+        &event("2026-10-14T15:00:00Z", json!(12.5), 9999999999),
+    );
+    assert_eq!(codex::read(&c.codex_home, 1).windows[0].left_pct, Some(87));
+    let claude = claude::parse(
+        &json!({"seen_at":1,"five_hour":{"used_percentage":12.5,"resets_at":9999999999u64}}),
+        1,
+    );
+    assert_eq!(claude.windows[0].left_pct, Some(87));
+    for (used, left) in [(0.1, 99), (79.9, 20), (89.9, 10), (99.9, 0)] {
+        assert_eq!(percent(&json!(used)), Some(left));
+    }
+}
+#[test]
+fn codex_premium_only_today_falls_back_with_five_file_budget() {
+    let c = config();
+    let previous = c.codex_home.join("sessions/2026/10/13");
+    fs::create_dir_all(&previous).expect("previous");
+    fs::write(
+        previous.join("codex.jsonl"),
+        event("2026-10-13T15:00:00Z", json!(12.5), 9999999999),
+    )
+    .expect("older event");
+    let today = c.codex_home.join("sessions/2026/10/14");
+    fs::create_dir_all(&today).expect("today");
+    for n in 0..5 {
+        fs::write(
+            today.join(format!("premium-{n}.jsonl")),
+            sample("codex-token-count-other-limit-id.jsonl"),
+        )
+        .expect("premium");
+    }
+    let result = codex::read(
+        &c.codex_home,
+        timestamp("2026-10-14T15:00:00Z").expect("today"),
+    );
+    assert_eq!(result.problem, None);
+    assert_eq!(result.windows[0].left_pct, Some(87));
+    assert_eq!(result.seen_at, timestamp("2026-10-13T15:00:00Z"));
+}
+
+#[test]
+fn importer_exit_codes_and_single_immediate_retry() {
+    use login::CursorLoginResult::Exited;
+    for code in [0, 1, 3, 4, 9] {
+        let c = config();
+        let mut state = UsageState::new(c.clone());
+        let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000);
+        let mut reads = 0;
+        let mut commands = 0;
+        let result = state.refresh_cursor_with_login(
+            1000,
+            |_| {
+                reads += 1;
+                if reads == 1 {
+                    unknown(Provider::Cursor, UsageProblem::NoLogin)
+                } else {
+                    good.clone()
+                }
+            },
+            |timeout| {
+                assert_eq!(timeout, std::time::Duration::from_secs(20));
+                commands += 1;
+                Exited(code)
+            },
+        );
+        assert_eq!(commands, 1);
+        assert_eq!(reads, if code == 0 { 2 } else { 1 });
+        assert_eq!(
+            result.problem,
+            match code {
+                0 => None,
+                4 => Some(UsageProblem::LoginExpired),
+                _ => Some(UsageProblem::NoLogin),
+            }
+        );
+        assert_eq!(state.cursor_login.no_consent, code == 3);
+        assert_eq!(
+            read_json::<u64>(&c.snapshot_file.with_extension("cursor-login")).expect("attempt"),
+            1000
+        );
+    }
+    let mut state = UsageState::new(config());
+    let mut reads = 0;
+    let mut commands = 0;
+    let result = state.refresh_cursor_with_login(
+        1000,
+        |_| {
+            reads += 1;
+            unknown(Provider::Cursor, UsageProblem::LoginExpired)
+        },
+        |_| {
+            commands += 1;
+            Exited(0)
+        },
+    );
+    assert_eq!(reads, 2);
+    assert_eq!(commands, 1);
+    assert_eq!(result.problem, Some(UsageProblem::LoginExpired));
+}
+#[test]
+fn importer_hour_limit_survives_new_process_and_stale_memory() {
+    use login::CursorLoginResult::Exited;
+    let c = config();
+    let mut commands = 0;
+    let mut stale = login::RefreshState::new(&c);
+    for (now, expected) in [(1000, 1), (1900, 1), (4600, 2)] {
+        let mut state = UsageState::new(c.clone());
+        state.refresh_with_sources(
+            &[Provider::Cursor],
+            now,
+            |_| unknown(Provider::Cursor, UsageProblem::LoginExpired),
+            |_| {
+                commands += 1;
+                Exited(1)
+            },
+        );
+        assert_eq!(commands, expected);
+    }
+    assert_eq!(
+        stale.attempt(&c, 5500, |_| panic!("persisted hourly limit")),
+        None
+    );
+    assert_eq!(
+        stale.attempt(&c, 8199, |_| panic!("one second before hour")),
+        None
+    );
+    assert_eq!(stale.attempt(&c, 8200, |_| Exited(4)), Some(Exited(4)));
+}
+#[test]
+fn importer_no_consent_stays_no_login_for_this_process() {
+    use login::CursorLoginResult::Exited;
+    let mut state = UsageState::new(config());
+    let result = state.refresh_cursor_with_login(
+        1000,
+        |_| unknown(Provider::Cursor, UsageProblem::LoginExpired),
+        |_| Exited(3),
+    );
+    assert_eq!(result.problem, Some(UsageProblem::NoLogin));
+    let result = state.refresh_cursor_with_login(
+        90000,
+        |_| unknown(Provider::Cursor, UsageProblem::LoginExpired),
+        |_| panic!("no consent never retries"),
+    );
+    assert_eq!(result.problem, Some(UsageProblem::NoLogin));
+}
+#[test]
+fn importer_timeout_and_command_failure_keep_problem_and_hour_limit() {
+    use login::CursorLoginResult;
+    for outcome in [
+        CursorLoginResult::TimedOut,
+        CursorLoginResult::Failed,
+        CursorLoginResult::Exited(1),
+    ] {
+        let c = config();
+        let mut state = UsageState::new(c.clone());
+        let result = state.refresh_cursor_with_login(
+            1000,
+            |_| unknown(Provider::Cursor, UsageProblem::LoginExpired),
+            |_| outcome,
+        );
+        assert_eq!(result.problem, Some(UsageProblem::LoginExpired));
+        let mut state = UsageState::new(c);
+        state.refresh_cursor_with_login(
+            1900,
+            |_| unknown(Provider::Cursor, UsageProblem::LoginExpired),
+            |_| panic!("failed attempt still hourly"),
+        );
+    }
+}
+#[test]
+fn importer_only_runs_for_login_problems_and_never_for_unwanted_cursor() {
+    for problem in [
+        UsageProblem::Offline,
+        UsageProblem::FormatChanged,
+        UsageProblem::NoData,
+    ] {
+        let mut state = UsageState::new(config());
+        state.refresh_cursor_with_login(
+            1000,
+            |_| unknown(Provider::Cursor, problem.clone()),
+            |_| panic!("not a login error"),
+        );
+    }
+    let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000);
+    let mut state = UsageState::new(config());
+    state.refresh_cursor_with_login(1000, |_| good.clone(), |_| panic!("healthy login"));
+    state.refresh_with_sources(
+        &[Provider::Claude],
+        2000,
+        |_| panic!("Cursor not wanted"),
+        |_| panic!("Cursor not wanted"),
+    );
+}
+#[test]
+fn successful_import_then_offline_keeps_known_login_error() {
+    use login::CursorLoginResult::Exited;
+    let mut state = UsageState::new(config());
+    let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1);
+    state.cursor_good = Some(good.clone());
+    state.cursor_result = Some(good);
+    let mut reads = 0;
+    let result = state.refresh_cursor_with_login(
+        1000,
+        |_| {
+            reads += 1;
+            unknown(
+                Provider::Cursor,
+                if reads == 1 {
+                    UsageProblem::LoginExpired
+                } else {
+                    UsageProblem::Offline
+                },
+            )
+        },
+        |_| Exited(0),
+    );
+    assert_eq!(reads, 2);
+    assert_eq!(result.problem, Some(UsageProblem::LoginExpired));
+    assert_eq!(result.windows[0].left_pct, None);
+}
+#[test]
+fn cli_login_hints_follow_cursor_line() {
+    for (problem, hint) in [
+        (UsageProblem::NoLogin, "run: herdr usage cursor-login"),
+        (
+            UsageProblem::LoginExpired,
+            "sign in to cursor.com in your browser; for a pasted login, run herdr usage cursor-login --paste again",
+        ),
+    ] {
+        let snapshot = UsageSnapshot {
+            version: 1,
+            taken_at: 1000,
+            providers: vec![unknown(Provider::Cursor, problem)],
+        };
+        let mut out = Vec::new();
+        cli::write_plain(&snapshot, 1000, &mut out).expect("print");
+        let text = String::from_utf8(out).expect("utf8");
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("cursor auto"));
+        assert!(lines[1].starts_with("cursor named"));
+        assert_eq!(lines[2], hint);
+    }
+}
+#[test]
+fn two_process_states_share_one_hourly_import_attempt() {
+    use login::CursorLoginResult::Exited;
+    let c = config();
+    let count = std::sync::atomic::AtomicUsize::new(0);
+    let states = [login::RefreshState::new(&c), login::RefreshState::new(&c)];
+    std::thread::scope(|scope| {
+        for mut state in states {
+            let c = &c;
+            let count = &count;
+            scope.spawn(move || {
+                state.attempt(c, 1000, |_| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Exited(1)
+                });
+            });
+        }
+    });
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn usage_worker_publishes_before_slow_importer_and_again_after_success() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let config = config();
+    atomic_json(
+        &config.claude_state_file,
+        &json!({"seen_at": 1000,
+        "five_hour": {"used_percentage": 20, "resets_at": 3000},
+        "seven_day": {"used_percentage": 30, "resets_at": 9000}}),
+    )
+    .expect("Claude reading");
+    log(
+        &config,
+        "rollout.jsonl",
+        &event("1970-01-01T00:16:40Z", json!(25), 3000),
+    );
+    let (updates_tx, updates_rx) = mpsc::channel();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let child = std::thread::spawn(move || {
+        let mut state = UsageState::new(config);
+        let mut reads = 0;
+        let snapshot = state.refresh_with_sources_and_publish(
+            &[Provider::Claude, Provider::Codex, Provider::Cursor],
+            1000,
+            |_| {
+                reads += 1;
+                if reads == 1 {
+                    unknown(Provider::Cursor, UsageProblem::NoLogin)
+                } else {
+                    cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000)
+                }
+            },
+            true,
+            |_| {
+                started_tx.send(()).expect("child started");
+                release_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release slow child");
+                login::CursorLoginResult::Exited(0)
+            },
+            |snapshot| updates_tx.send(snapshot).expect("snapshot event"),
+        );
+        done_tx.send((snapshot, reads)).expect("finished");
+    });
+    let first = updates_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first update");
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("login started");
+    assert_eq!(
+        first
+            .providers
+            .iter()
+            .map(|p| p.provider)
+            .collect::<Vec<_>>(),
+        vec![Provider::Claude, Provider::Codex, Provider::Cursor]
+    );
+    assert_eq!(first.providers[0].windows[0].left_pct, Some(80));
+    assert_eq!(first.providers[1].windows[0].left_pct, Some(75));
+    assert_eq!(first.providers[2].problem, Some(UsageProblem::NoLogin));
+    assert!(done_rx.try_recv().is_err(), "worker is still in the child");
+    assert!(
+        updates_rx.try_recv().is_err(),
+        "no second update before child exits"
+    );
+    release_tx.send(()).expect("finish child");
+    let second = updates_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("Cursor update");
+    let (final_snapshot, reads) = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("worker done");
+    child.join().expect("worker joined");
+    assert_eq!(reads, 2, "exactly one immediate Cursor refetch");
+    assert_eq!(second.providers[2].problem, None);
+    assert!(second.providers[2].windows[0].left_pct.is_some());
+    assert_eq!(
+        &second.providers[..2],
+        &first.providers[..2],
+        "local readings preserved"
+    );
+    assert_eq!(final_snapshot, second);
+    assert!(updates_rx.try_recv().is_err(), "only two snapshot updates");
+}
+
+#[test]
+fn worker_no_consent_preserves_hour_and_grant_imports_on_next_refresh() {
+    use login::CursorLoginResult::Exited;
+    let c = config();
+    let marker = c.snapshot_file.with_extension("cursor-login");
+    let mut state = UsageState::new(c.clone());
+    let snapshot = state.refresh_worker_with_sources(
+        &[Provider::Cursor],
+        1000,
+        false,
+        |_| unknown(Provider::Cursor, UsageProblem::NoLogin),
+        |_| panic!("no consent must not run importer"),
+        |_| {},
+    );
+    assert_eq!(snapshot.providers[0].problem, Some(UsageProblem::NoLogin));
+    assert!(state.cursor_login.no_consent);
+    assert!(
+        !marker.exists(),
+        "no consent must not create the hourly marker"
+    );
+    assert_eq!(
+        state
+            .cursor_login
+            .attempt(&c, 1001, |_| panic!("latched no consent")),
+        None
+    );
+    assert!(!marker.exists());
+    let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1300);
+    let mut reads = 0;
+    let mut imports = 0;
+    let snapshot = state.refresh_worker_with_sources(
+        &[Provider::Cursor],
+        1300,
+        true,
+        |_| {
+            reads += 1;
+            if reads == 1 {
+                unknown(Provider::Cursor, UsageProblem::NoLogin)
+            } else {
+                good.clone()
+            }
+        },
+        |_| {
+            imports += 1;
+            Exited(0)
+        },
+        |_| {},
+    );
+    assert_eq!(
+        imports, 1,
+        "grant imports on the next refresh, before the hour or poll interval"
+    );
+    assert_eq!(reads, 2);
+    assert!(!state.cursor_login.no_consent);
+    assert_eq!(snapshot.providers[0], good);
+    assert_eq!(
+        read_json::<u64>(&marker).expect("real attempt marker"),
+        1300
+    );
+    let mut reloaded = login::RefreshState::new(&c);
+    assert_eq!(
+        reloaded.attempt(&c, 1301, |_| panic!("real attempt is still hourly")),
+        None
+    );
+}
+
+#[test]
+fn saved_login_invalidates_disk_and_running_worker_without_spending_import_hour() {
+    for problem in [UsageProblem::LoginExpired, UsageProblem::NoLogin] {
+        let c = config();
+        let mut state = UsageState::new(c.clone());
+        state.refresh_with_cursor_fetch(&[Provider::Cursor], 1000, |_| {
+            unknown(Provider::Cursor, problem.clone())
+        });
+        let lease = c.snapshot_file.with_extension("cursor-login");
+        atomic_json(&lease, &1000_u64).expect("lease");
+        let lease_before = fs::read(&lease).expect("lease bytes");
+        cursor_login_saved(&c).expect("saved login");
+        assert!(cursor_fetch_due(&c, 1300));
+        let cached: UsageSnapshot = read_json(&c.snapshot_file).expect("pending snapshot");
+        assert_eq!(cached.providers[0].problem, Some(UsageProblem::NoData));
+        assert!(cached.providers[0]
+            .windows
+            .iter()
+            .all(|w| w.left_pct.is_none()));
+        assert_eq!(fs::read(&lease).expect("lease unchanged"), lease_before);
+        let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1300);
+        let next = state.refresh_with_cursor_fetch(&[Provider::Cursor], 1300, |_| good.clone());
+        assert_eq!(next.providers[0], good);
+        assert_eq!(cursor_fetch_time(&c), Some(1300));
+        state.refresh_with_cursor_fetch(&[Provider::Cursor], 1301, |_| panic!("still throttled"));
+        UsageState::new(c).refresh_with_cursor_fetch(&[Provider::Cursor], 1301, |_| {
+            panic!("disk throttle restored")
+        });
+    }
+}
+
+#[test]
+fn stale_worker_cannot_republish_expired_login_after_saved_login() {
+    let c = config();
+    let mut state = UsageState::new(c.clone());
+    let mut stale = state.refresh_with_cursor_fetch(&[Provider::Cursor], 1000, |_| {
+        unknown(Provider::Cursor, UsageProblem::LoginExpired)
+    });
+    cursor_login_saved(&c).expect("saved login");
+    state.save_snapshot(&mut stale);
+    assert_eq!(stale.providers[0].problem, Some(UsageProblem::NoData));
+    let next = state.refresh_with_cursor_fetch(&[Provider::Cursor], 1300, |_| {
+        unknown(Provider::Cursor, UsageProblem::Offline)
+    });
+    assert_eq!(next.providers[0].problem, Some(UsageProblem::Offline));
+}
+
+#[test]
+fn automatic_saved_login_consumes_revision_and_restores_fetch_throttle() {
+    let c = config();
+    let mut state = UsageState::new(c.clone());
+    let mut reads = 0;
+    let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000);
+    let next = state.refresh_worker_with_sources(
+        &[Provider::Cursor],
+        1000,
+        true,
+        |_| {
+            reads += 1;
+            if reads == 1 {
+                unknown(Provider::Cursor, UsageProblem::LoginExpired)
+            } else {
+                good.clone()
+            }
+        },
+        |_| {
+            cursor_login_saved(&c).expect("import saved");
+            login::CursorLoginResult::Exited(0)
+        },
+        |_| {},
+    );
+    assert_eq!(reads, 2);
+    assert_eq!(next.providers[0], good);
+    assert_eq!(cursor_fetch_time(&c), Some(1000));
+    state.refresh_with_cursor_fetch(&[Provider::Cursor], 1001, |_| panic!("no duplicate fetch"));
+}

@@ -13,12 +13,15 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 
 mod agent_model;
 mod agent_resume;
+mod agent_summary;
 mod api;
 mod app;
+mod black_box;
 mod build_info;
 mod checksum;
 mod cli;
 mod client;
+mod commander;
 mod composer;
 mod config;
 mod detect;
@@ -54,6 +57,7 @@ mod terminal_setup;
 mod terminal_theme;
 mod ui;
 mod update;
+pub mod usage;
 mod workspace;
 mod worktree;
 mod wsl;
@@ -122,6 +126,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # workspace_picker = "prefix+w"
 # goto = "prefix+g"
 # composer = "prefix+/"
+# commander = "f2"
 # new_workspace = "prefix+shift+n"
 # new_worktree = "prefix+shift+g"
 # open_worktree = ""    # optional, unset by default
@@ -233,11 +238,51 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to create tabs immediately with generated names.
 # prompt_new_tab_name = true
 
+# Confirm a finished agent when its pane is clicked or focused.
+# Only the focused pane is confirmed. Off keeps confirmation manual.
+# Also available in Settings → experiments.
+# acknowledge_on_pane_focus = false
+
 # Use Nerd Font glyphs in optional UI chrome.
 # nerd_font = false
 
 # Show detected/reported agent labels in split pane borders when no manual pane name is set.
 # show_agent_labels_on_pane_borders = false
+
+# Fields on each pane's top edge. Status and name are on; the rest are off,
+# matching the current name-only titles. Turn them on from Settings → pane
+# labels, or here. Status is the agent's mark before its name: a spinner while
+# it works, a blinking dot once it finishes, which a click turns into a steady check.
+# The pending dot blinks even in the focused pane, in sync with tab attention.
+# usage is off until you set it true.
+# [ui.pane_header]
+# status = true
+# agent_name = true
+# hostname = false
+# working_directory = false
+# parent_directory = false
+# git_branch = false
+# git_status = false
+# usage = false
+
+# Allowance meters (five hour and weekly) for Claude, GPT and Cursor.
+# The sidebar lists the providers of the agents that are open (sidebar, on).
+# The agent table Allowance column (table) and each pane header
+# (usage in [ui.pane_header]) are off until you turn them on here or in
+# Settings → pane labels. alerts speaks once per window at 10% left;
+# SPEAK=0 in the environment silences it. `herdr view usage hide` turns the
+# table, the headers and the sidebar off together for the session.
+# [ui.usage]
+# table = false
+# sidebar = true
+# alerts = false
+# alert_command = "" # macOS say by default; whitespace-separated program and arguments
+# alert_on_recovery = true # with alerts on, speak once when a window resets or climbs back above 10% left
+# alert_pane = "" # also send that recovery line to this pane by name; empty sends nothing
+# cursor_login = false # enable with herdr usage cursor-login
+# claude_statusline = false # display only; set true to print meters; usage is recorded either way
+# cursor_pools = "both" # both or tighter; table and sidebar, labelled cm and om. A pane header always shows the tighter pool (cm or om)
+# codex_home = "~/.codex" # read first; $CODEX_HOME, ~/.codex and pane Codex homes are read too
 
 # Agent panel scope: "current" or "all". Toggling it in the sidebar saves this setting.
 # agent_panel_scope = "all"
@@ -387,6 +432,10 @@ fn main() -> io::Result<()> {
         std::process::exit(2);
     }
 
+    if args.get(1).map(String::as_str) == Some("usage") {
+        return usage::cli::run(&args[2..]);
+    }
+
     if let cli::CommandOutcome::Handled(code) = cli::maybe_run(&args)? {
         std::process::exit(code);
     }
@@ -449,12 +498,14 @@ fn main() -> io::Result<()> {
         println!("       herdr workspace <subcommand> ...");
         println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
+        println!("       herdr view <part> [show|hide|toggle] ...");
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
         println!("       herdr wait <subcommand> ...");
         println!("       herdr session <subcommand> ...");
         println!("       herdr shell-init <shell>");
         println!("       herdr integration <subcommand> ...");
+        println!("       herdr usage [--json | claude-statusline | cursor-login [--paste | --refresh | --status | --forget] [--browser <name>]]");
         println!();
         println!("Common commands:");
         for (command, description) in [
@@ -464,6 +515,7 @@ fn main() -> io::Result<()> {
                 "Show local client and running server status",
             ),
             ("herdr update", "Download and install the latest version"),
+            ("herdr usage", "Read provider allowances; cursor-login imports on macOS or accepts a pasted login"),
             (
                 "herdr server stop",
                 "Stop the running server via the API socket",
@@ -493,6 +545,10 @@ fn main() -> io::Result<()> {
                 "Git worktree helpers over the socket API",
             ),
             ("herdr tab <subcommand>", "Tab helpers over the socket API"),
+            (
+                "herdr view <part> [show|hide|toggle]",
+                "Fold or show the sidebar, spaces, agent table, a space's agents or group, minimaps, or the usage meters",
+            ),
             (
                 "herdr agent <subcommand>",
                 "Agent/terminal helpers over the socket API",
@@ -651,6 +707,8 @@ fn main() -> io::Result<()> {
         // mode. The hook runs before VTI setup, so the saved mode lives in
         // the shared slot instead of a captured local, and taking it clears
         // the slot.
+        // Windows has no keyboard_enhancement field, so the update fills it there.
+        #[allow(clippy::needless_update)]
         let _ = crate::terminal_setup::HostProtocolSetup {
             modify_other_keys: panic_resets_modify_other_keys,
             #[cfg(not(windows))]
@@ -767,6 +825,18 @@ fn setup_monolithic_protocols(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_documents_acknowledge_on_pane_focus_in_the_ui_section() {
+        let default: config::Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        assert!(!default.ui.acknowledge_on_pane_focus);
+        let enabled = DEFAULT_CONFIG.replace(
+            "# acknowledge_on_pane_focus = false",
+            "acknowledge_on_pane_focus = true",
+        );
+        let configured: config::Config = toml::from_str(&enabled).unwrap();
+        assert!(configured.ui.acknowledge_on_pane_focus);
+    }
 
     #[test]
     fn nested_herdr_blocks_when_env_is_set() {

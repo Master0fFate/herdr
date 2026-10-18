@@ -9,6 +9,7 @@ mod agent_resume;
 mod agents;
 mod api;
 mod api_helpers;
+mod commander;
 mod composer;
 mod config_io;
 mod creation;
@@ -19,6 +20,7 @@ mod session;
 pub mod state;
 mod terminal_targets;
 mod theme_sync;
+pub(crate) mod view;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -40,6 +42,8 @@ pub(crate) const HEADLESS_ANIMATION_TICK_STEP: u32 = ANIMATION_TICKS_PER_FRAME;
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+/// How often allowances are read besides when an agent finishes a turn.
+pub(crate) const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub(crate) const AGENT_MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
@@ -49,7 +53,6 @@ const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
 
 use crossterm::terminal;
-use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use tokio::sync::{mpsc, Notify};
 use tracing::info;
@@ -103,6 +106,25 @@ impl AgentNameClickState {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TabClickState {
+    ws_idx: usize,
+    tab_idx: usize,
+    row: u16,
+    col: u16,
+    at: Instant,
+}
+
+impl TabClickState {
+    fn is_double_click_for(self, next: Self) -> bool {
+        self.ws_idx == next.ws_idx
+            && self.tab_idx == next.tab_idx
+            && next.at.duration_since(self.at) <= PANE_DOUBLE_CLICK_WINDOW
+            && self.row.abs_diff(next.row) <= 1
+            && self.col.abs_diff(next.col) <= 1
+    }
+}
+
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
@@ -120,15 +142,45 @@ pub struct App {
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
+    /// Allowance readings: owned here, run on a background thread.
+    pub(crate) usage_state: std::sync::Arc<std::sync::Mutex<crate::usage::UsageState>>,
+    pub(crate) usage_refresh_in_flight: bool,
+    /// A turn finished while a refresh ran; refresh again when it lands.
+    pub(crate) usage_refresh_due_after_in_flight: bool,
+    pub(crate) last_usage_refresh: Instant,
+    /// The newest "an agent finished" stamp seen, to spot the next finish.
+    pub(crate) usage_finish_stamp: Option<std::time::SystemTime>,
+    /// When the countdowns on screen next change text.
+    pub(crate) usage_redraw_deadline: Option<Instant>,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) last_agent_model_refresh: Instant,
     pub(crate) agent_model_refresh_in_flight: bool,
+    pub(crate) summary_refresh_in_flight: HashSet<crate::terminal::TerminalId>,
     pub(crate) agent_model_cache:
         HashMap<crate::terminal::TerminalId, crate::agent_model::AgentModelCacheEntry>,
     pub(crate) last_pane_click: Option<PaneClickState>,
+    /// True from a Ctrl+click press that opened a URL until its release. The
+    /// drag and release of that click belong to the URL click, so they are
+    /// not forwarded to the pane, whose program would open the URL again.
+    pub(crate) url_click_in_progress: bool,
     pub(crate) last_agent_name_click: Option<AgentNameClickState>,
+    pub(crate) last_tab_click: Option<TabClickState>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
+    /// When the Commander's star next moves, while it has one moving.
+    pub(crate) commander_frame_deadline: Option<Instant>,
+    /// When it last moved, so each step covers the time that really passed.
+    pub(crate) commander_last_frame: Option<Instant>,
+    /// What answers the Commander's questions in place of Jev. Tests set it
+    /// so nothing reaches the network; `None` asks Jev with the configured
+    /// key.
+    pub(crate) commander_oracle:
+        Option<std::sync::Arc<dyn crate::commander::jev::Oracle + Send + Sync>>,
+    /// Set while the Commander carries out a command. Carrying one out can
+    /// handle other pending events part way through, while the box is
+    /// closed; the Commander's own answers that arrive then wait here.
+    pub(crate) commander_busy: bool,
+    pub(crate) commander_deferred: Vec<crate::events::AppEvent>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
@@ -281,23 +333,29 @@ impl App {
         let mut restored_detached_agents = Vec::new();
         let mut restored_agent_order = Vec::new();
         let mut restored_composer_agent = None;
+        let mut restored_composer_folder = None;
         let mut restored_sidebar_width = None;
         let mut restored_sidebar_section_split = None;
         let mut restored_collapsed_space_keys = std::collections::HashSet::new();
         let mut restored_collapsed_agent_space_ids = std::collections::HashSet::new();
         let mut restored_sidebar_collapsed = false;
+        let mut restored_agent_table_collapsed = false;
         let mut restored_spaces_collapsed = false;
+        let mut restored_usage_hidden = false;
         let (workspaces, active, selected) = if no_session {
             (Vec::new(), None, 0)
         } else if let Some(snap) = crate::persist::load() {
             restored_agent_order = snap.agent_order.clone();
             restored_composer_agent = snap.composer_agent.clone();
+            restored_composer_folder = snap.composer_folder.clone();
             restored_sidebar_width = snap.sidebar_width;
             restored_sidebar_section_split = snap.sidebar_section_split;
             restored_collapsed_space_keys = snap.collapsed_space_keys.clone();
             restored_collapsed_agent_space_ids = snap.collapsed_agent_space_ids.clone();
             restored_sidebar_collapsed = snap.sidebar_collapsed;
+            restored_agent_table_collapsed = snap.agent_table_collapsed;
             restored_spaces_collapsed = snap.spaces_collapsed;
+            restored_usage_hidden = snap.usage_hidden;
             let history = config
                 .experimental
                 .pane_history
@@ -363,6 +421,12 @@ impl App {
         if let Some(agent) = restored_composer_agent {
             composer.restore_agent(&agent);
         }
+        // The started-in folders belong to the machine rather than to a
+        // session, so they are read whether or not a session was restored.
+        composer.restore_used(&crate::persist::load_used_folders());
+        if let Some(folder) = restored_composer_folder {
+            composer.restore_folder(&folder);
+        }
 
         let (sidebar_min_width, sidebar_max_width) = crate::config::validated_sidebar_bounds(
             config.ui.sidebar_min_width,
@@ -375,6 +439,8 @@ impl App {
             detached_agents: restored_detached_agents,
             detached_git_statuses: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            host_pops_out_panes: false,
+            pending_pane_pop_out: None,
             pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
             active,
@@ -398,10 +464,14 @@ impl App {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
-            creating_new_tab: false,
             requested_new_tab_name: None,
+            requested_new_tab_goal: None,
             rename_pane_target: None,
             worktree_create: None,
+            describe_dialog: None,
+            request_submit_describe_dialog: false,
+            hovered_space: None,
+            hovered_tab: None,
             worktree_open: None,
             worktree_remove: None,
             worktree_land: None,
@@ -410,12 +480,14 @@ impl App {
             worktree_auto_land: config.worktrees.auto_land,
             request_land_worktree: None,
             request_land_agent_prompt: None,
+            request_refresh_summary: None,
             landing_worktrees: std::collections::HashSet::new(),
             landing_failures: std::collections::HashMap::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
             composer,
+            commander: crate::commander::CommanderState::default(),
             release_notes: None,
             product_announcement: startup_product_announcement.map(|announcement| {
                 state::ProductAnnouncementState {
@@ -445,31 +517,19 @@ impl App {
             },
             sidebar_width_auto: false,
             sidebar_collapsed: restored_sidebar_collapsed,
+            agent_table_collapsed: restored_agent_table_collapsed,
             spaces_collapsed: restored_spaces_collapsed,
+            usage_hidden: restored_usage_hidden,
             sidebar_section_split: restored_sidebar_section_split.unwrap_or(0.5),
             agent_panel_scope: state::AgentPanelScope::AllWorkspaces,
             agent_table_scroll: 0,
+            tab_scroll: 0,
+            tab_scroll_follow_active: true,
             mobile_switcher_scroll: 0,
-            view: state::ViewState {
-                layout: state::ViewLayout::Desktop,
-                composer: crate::ui::ComposerLayout::default(),
-                sidebar_rect: ratatui::layout::Rect::default(),
-                workspace_card_areas: Vec::new(),
-                agent_row_areas: Vec::new(),
-                agent_folder_areas: Vec::new(),
-                agent_table: crate::ui::AgentTableLayout::default(),
-                agent_locations: std::collections::HashMap::new(),
-                terminal_area: Rect::default(),
-                mobile_header_rect: Rect::default(),
-                mobile_menu_hit_area: Rect::default(),
-                toast_hit_area: Rect::default(),
-                pane_infos: Vec::new(),
-                pane_chrome_controls: Vec::new(),
-                pane_title_hit_areas: Vec::new(),
-                split_borders: Vec::new(),
-            },
+            view: state::ViewState::default(),
             drag: None,
             workspace_press: None,
+            tab_press: None,
             pane_press: None,
             agent_press: None,
             sidebar_agent_press: None,
@@ -498,9 +558,22 @@ impl App {
             hide_cursor_when_unfocused: config.ui.hide_cursor_when_unfocused,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
+            prompt_new_tab_name: config.ui.prompt_new_tab_name,
+            acknowledge_on_pane_focus: config.ui.acknowledge_on_pane_focus,
             nerd_font: config.ui.nerd_font,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
+            pane_header: config.ui.pane_header,
+            usage_config: config.ui.usage.clone(),
+            usage_snapshot: None,
+            usage_now: 0,
             pane_history_persistence: config.experimental.pane_history,
+            refresh_summary_with_grok: config.ui.refresh_summary_with_grok,
+            hide_attached_agents: config.ui.hide_attached_agents,
+            jev_api_key: config.commander.api_key(),
+            jev_model: config.commander.jev_model.clone(),
+            commander_planner_model: config.commander.planner_model.clone(),
+            refresh_summary_prompt: config.ui.refresh_summary_prompt.clone(),
+            request_save_refresh_summary_prompt: false,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
@@ -532,6 +605,10 @@ impl App {
                 list: state::SelectionListState::new(0),
                 original_palette: None,
                 original_theme: None,
+                editing_refresh_prompt: false,
+                capturing_commander_key: false,
+                refused_commander_key: None,
+                editing_jev_key: None,
             },
             integration_recommendations: crate::integration::integration_recommendations(),
             integration_install_messages: Vec::new(),
@@ -576,14 +653,30 @@ impl App {
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
+            usage_state: std::sync::Arc::new(std::sync::Mutex::new(crate::usage::UsageState::new(
+                crate::usage::UsageConfig::configured(),
+            ))),
+            usage_refresh_in_flight: false,
+            usage_refresh_due_after_in_flight: false,
+            last_usage_refresh: Instant::now() - USAGE_REFRESH_INTERVAL,
+            usage_finish_stamp: None,
+            usage_redraw_deadline: None,
             git_status_cache: HashMap::new(),
             last_agent_model_refresh: Instant::now() - AGENT_MODEL_REFRESH_INTERVAL,
             agent_model_refresh_in_flight: false,
+            summary_refresh_in_flight: HashSet::new(),
             agent_model_cache: HashMap::new(),
             last_pane_click: None,
+            url_click_in_progress: false,
             last_agent_name_click: None,
+            last_tab_click: None,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
+            commander_frame_deadline: None,
+            commander_last_frame: None,
+            commander_oracle: None,
+            commander_busy: false,
+            commander_deferred: Vec::new(),
             next_auto_update_check: auto_updates_enabled(no_session)
                 .then_some(Instant::now() + AUTO_UPDATE_CHECK_INTERVAL),
             agent_metadata_deadline: None,
@@ -655,6 +748,9 @@ impl App {
         if let Some(agent) = snapshot.composer_agent.as_deref() {
             app.state.composer.restore_agent(agent);
         }
+        if let Some(folder) = snapshot.composer_folder.as_deref() {
+            app.state.composer.restore_folder(folder);
+        }
         if let Some(width) = snapshot.sidebar_width {
             app.state.sidebar_width = width;
             app.state.sidebar_width_source = state::SidebarWidthSource::Persisted;
@@ -665,7 +761,9 @@ impl App {
         app.state.collapsed_space_keys = snapshot.collapsed_space_keys.clone();
         app.state.collapsed_agent_space_ids = snapshot.collapsed_agent_space_ids.clone();
         app.state.sidebar_collapsed = snapshot.sidebar_collapsed;
+        app.state.agent_table_collapsed = snapshot.agent_table_collapsed;
         app.state.spaces_collapsed = snapshot.spaces_collapsed;
+        app.state.usage_hidden = snapshot.usage_hidden;
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {
@@ -763,7 +861,13 @@ impl App {
 
             if self.state.request_new_workspace {
                 self.state.request_new_workspace = false;
-                self.create_workspace();
+                self.open_new_describe_dialog();
+                needs_render = true;
+            }
+
+            if self.state.request_submit_describe_dialog {
+                self.state.request_submit_describe_dialog = false;
+                self.create_space_from_dialog();
                 needs_render = true;
             }
 
@@ -809,6 +913,10 @@ impl App {
 
             if let Some((target, text)) = self.state.request_land_agent_prompt.take() {
                 self.submit_land_prompt(&target, &text);
+                needs_render = true;
+            }
+
+            if self.start_pending_summary_refresh() {
                 needs_render = true;
             }
 
@@ -1215,9 +1323,13 @@ impl App {
             self.state.right_click_passthrough_modifiers =
                 config.ui.right_click_passthrough_modifiers();
             self.state.confirm_close = config.ui.confirm_close;
+            self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
+            self.state.acknowledge_on_pane_focus = config.ui.acknowledge_on_pane_focus;
             self.state.nerd_font = config.ui.nerd_font;
             self.state.show_agent_labels_on_pane_borders =
                 config.ui.show_agent_labels_on_pane_borders;
+            self.state.pane_header = config.ui.pane_header;
+            self.state.usage_config = config.ui.usage.clone();
             self.state.accent = crate::config::parse_color(&config.ui.accent);
             if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
                 self.state.request_client_config_reload = true;
@@ -1225,6 +1337,17 @@ impl App {
             self.state.sound = config.ui.sound.clone();
             self.state.notify_active_tab = config.ui.notify_active_tab;
             self.state.toast_config = config.ui.toast.clone();
+            self.state.refresh_summary_with_grok = config.ui.refresh_summary_with_grok;
+            self.state.hide_attached_agents = config.ui.hide_attached_agents;
+            if !self.state.settings.editing_refresh_prompt {
+                self.state.refresh_summary_prompt = config.ui.refresh_summary_prompt.clone();
+            }
+        }
+
+        if !invalid_section("commander") {
+            self.state.jev_api_key = config.commander.api_key();
+            self.state.jev_model = config.commander.jev_model.clone();
+            self.state.commander_planner_model = config.commander.planner_model.clone();
         }
 
         if !invalid_section("experimental") {
@@ -1397,7 +1520,11 @@ impl App {
                     }
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
-                    if self.state.mode == Mode::Composer {
+                    if self.state.mode == Mode::Commander {
+                        self.commander_paste(&text);
+                    } else if self.state.mode == Mode::Settings {
+                        self.settings_paste(&text);
+                    } else if self.state.mode == Mode::Composer {
                         self.state.composer.task.insert_str(&text);
                     } else if self.state.mode == Mode::Terminal {
                         if let Some((_, _, runtime)) =
@@ -1484,8 +1611,12 @@ impl App {
                     input::ComposerKeyOutcome::Edited => {}
                 }
             }
-            Mode::RenameWorkspace | Mode::RenamePane => {
+            Mode::Commander => self.commander_key(key),
+            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                 input::handle_rename_key(&mut self.state, key_event);
+            }
+            Mode::DescribeDialog => {
+                input::handle_describe_dialog_key(&mut self.state, key_event);
             }
             Mode::NewLinkedWorktree => {
                 self.handle_worktree_create_key(key_event);
@@ -1822,6 +1953,182 @@ mod tests {
         let feedback = app.state.copy_feedback.as_ref().expect("copy feedback");
         assert_eq!(feedback.message, "copied to clipboard");
         assert!(app.copy_feedback_deadline.is_some());
+    }
+
+    #[test]
+    fn a_later_probed_title_does_not_replace_the_summary() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("summary-freeze");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let session_id = "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c";
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:grok".into(),
+                agent: "grok".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
+
+        let entry = |title: &str| crate::agent_model::AgentModelCacheEntry {
+            session_id: session_id.into(),
+            session_file: "/tmp".into(),
+            modified: std::time::SystemTime::now(),
+            info: None,
+            title: Some(title.into()),
+            title_scanned_len: 0,
+        };
+
+        app.handle_internal_event(AppEvent::AgentModelRefreshed {
+            results: vec![crate::agent_model::AgentModelRefreshResult {
+                terminal_id: terminal_id.clone(),
+                entry: entry("Improve Agent Summary to be useful"),
+            }],
+        });
+        assert_eq!(
+            app.state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .session_title
+                .as_deref(),
+            Some("Improve Agent Summary to be useful")
+        );
+
+        app.handle_internal_event(AppEvent::AgentModelRefreshed {
+            results: vec![crate::agent_model::AgentModelRefreshResult {
+                terminal_id: terminal_id.clone(),
+                entry: entry("Land this on parent"),
+            }],
+        });
+        assert_eq!(
+            app.state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .session_title
+                .as_deref(),
+            Some("Improve Agent Summary to be useful"),
+            "a later probe must not replace the first fill"
+        );
+    }
+
+    #[test]
+    fn summary_refreshed_replaces_the_session_title() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("summary-refresh");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let session_id = "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c";
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:grok".into(),
+                agent: "grok".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_session_title(Some("Improve Agent Summary to be useful".into()));
+        app.summary_refresh_in_flight.insert(terminal_id.clone());
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .summary_refreshing = true;
+
+        app.handle_internal_event(AppEvent::SummaryRefreshed {
+            terminal_id: terminal_id.clone(),
+            session_id: session_id.into(),
+            title: Some("Land the herdr worktree".into()),
+        });
+
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.session_title.as_deref(),
+            Some("Land the herdr worktree")
+        );
+        assert!(!terminal.summary_refreshing);
+        assert!(!app.summary_refresh_in_flight.contains(&terminal_id));
+    }
+
+    #[test]
+    fn osc_title_event_updates_the_summary() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("osc-title");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_session_title(Some("Improve Agent Summary to be useful".into()));
+
+        app.handle_internal_event(AppEvent::OscTitleChanged {
+            pane_id: pane,
+            title: Some("Reading files | Hide yellow banner".into()),
+        });
+        assert_eq!(
+            app.state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .effective_title()
+                .as_deref(),
+            Some("Reading files | Hide yellow banner")
+        );
+
+        app.handle_internal_event(AppEvent::OscTitleChanged {
+            pane_id: pane,
+            title: Some("Compacting | Hide yellow banner".into()),
+        });
+        assert_eq!(
+            app.state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .effective_title()
+                .as_deref(),
+            Some("Compacting | Hide yellow banner")
+        );
+
+        app.handle_internal_event(AppEvent::OscTitleChanged {
+            pane_id: pane,
+            title: None,
+        });
+        assert_eq!(
+            app.state
+                .terminals
+                .get(&terminal_id)
+                .unwrap()
+                .effective_title()
+                .as_deref(),
+            Some("Improve Agent Summary to be useful")
+        );
     }
 
     #[test]
@@ -2199,6 +2506,575 @@ mod tests {
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
+
+    #[test]
+    fn settings_save_refresh_summary_with_grok_persists_then_applies_live_config() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-save-refresh-summary-grok");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(!app.state.refresh_summary_with_grok);
+
+        app.save_refresh_summary_with_grok(true);
+
+        assert!(app.state.refresh_summary_with_grok);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[ui]"));
+        assert!(content.contains("refresh_summary_with_grok = true"));
+        assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn settings_save_jev_api_key_persists_then_removes() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-save-jev-api-key");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        std::env::remove_var("TYPESAFE_API_KEY");
+
+        let mut app = test_app();
+        app.save_jev_api_key("ts-secret-1234");
+        assert_eq!(app.state.jev_api_key.as_deref(), Some("ts-secret-1234"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[commander]"));
+        assert!(content.contains("jev_api_key = \"ts-secret-1234\""));
+
+        app.save_jev_api_key("");
+        assert_eq!(app.state.jev_api_key, None);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("jev_api_key"));
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    mod commander_lines {
+        use super::*;
+        use crate::commander::intent::{Action, Command};
+        use crate::commander::jev::{Answers, Oracle, Questions};
+        use crate::commander::plan::Reading;
+        use crate::commander::{Paragraph, Phase};
+
+        /// Stands in for Jev, so nothing reaches the network. The tests answer
+        /// each reading themselves through `commander_read`.
+        struct Offline;
+
+        impl Oracle for Offline {
+            fn ask(&self, _: &serde_json::Value, _: &Questions) -> Result<Answers, String> {
+                Err("offline".into())
+            }
+        }
+
+        fn app_with(line: &str, clauses: &[&str], after: Option<Vec<Vec<usize>>>) -> App {
+            let mut app = test_app();
+            app.commander_oracle = Some(std::sync::Arc::new(Offline));
+            crate::app::input::open_commander(&mut app.state);
+            app.state.commander.field.insert_str(line);
+            let mut paragraph =
+                Paragraph::new(line.into(), clauses.iter().map(|c| c.to_string()).collect());
+            paragraph.after = after;
+            app.state.commander.paragraph = Some(paragraph);
+            app.pump_paragraph(Instant::now());
+            app
+        }
+
+        fn phase(app: &App, i: usize) -> Phase {
+            app.state.commander.paragraph.as_ref().unwrap().steps[i]
+                .phase
+                .clone()
+        }
+
+        fn generation(app: &App, i: usize) -> u64 {
+            match phase(app, i) {
+                Phase::Reading(generation) => generation,
+                other => panic!("step {i} is not being read: {other:?}"),
+            }
+        }
+
+        fn reading(command: Command, confidence: f64) -> Result<Reading, String> {
+            Ok(Reading {
+                command,
+                confidence,
+                careful: false,
+                runner_up: None,
+            })
+        }
+
+        #[test]
+        fn an_unsure_reading_waits_for_enter() {
+            let line = "make it bigger";
+            let mut app = app_with(line, &[line], Some(vec![vec![]]));
+            let g = generation(&app, 0);
+            app.commander_read(g, line, reading(Command::Act(Action::Zoom), 0.4));
+            assert_eq!(app.state.mode, Mode::Commander);
+            assert!(matches!(phase(&app, 0), Phase::Held { .. }));
+            assert!(
+                matches!(&app.state.commander.reading, Some(Ok(said)) if said.contains("zoom"))
+            );
+            // An answer to a request no step is waiting on is dropped.
+            app.commander_read(g + 100, line, reading(Command::Act(Action::Help), 1.0));
+            assert_eq!(app.state.mode, Mode::Commander);
+
+            app.submit_commander();
+            assert_ne!(app.state.mode, Mode::Commander);
+            assert!(app.state.commander.paragraph.is_none());
+        }
+
+        #[test]
+        fn a_sure_reading_runs_at_once() {
+            let line = "show me the keys";
+            let mut app = app_with(line, &[line], Some(vec![vec![]]));
+            let g = generation(&app, 0);
+            app.commander_read(g, line, reading(Command::Act(Action::Help), 0.9));
+            assert_eq!(app.state.mode, Mode::KeybindHelp);
+        }
+
+        #[test]
+        fn commands_that_wait_for_nothing_are_read_together() {
+            let line = "toggle the sidebar and toggle the agent table";
+            let mut app = app_with(
+                line,
+                &["toggle the sidebar", "toggle the agent table"],
+                Some(vec![vec![], vec![]]),
+            );
+            let (first, second) = (generation(&app, 0), generation(&app, 1));
+
+            // The second answers first and runs; the box stays open for the
+            // first, which is still being read.
+            let table_before = app.state.agent_table_collapsed;
+            app.commander_read(
+                second,
+                line,
+                reading(Command::Act(Action::ToggleAgentTable), 0.9),
+            );
+            assert_ne!(app.state.agent_table_collapsed, table_before);
+            assert_eq!(app.state.mode, Mode::Commander);
+            assert!(matches!(phase(&app, 0), Phase::Reading(_)));
+            assert_eq!(app.state.commander.field.text(), line);
+
+            app.commander_read(
+                first,
+                line,
+                reading(Command::Act(Action::ToggleSidebar), 0.9),
+            );
+            assert_ne!(app.state.mode, Mode::Commander);
+            assert!(app.state.commander.paragraph.is_none());
+            assert!(app.state.commander.field.is_empty());
+        }
+
+        #[test]
+        fn a_command_waits_for_the_one_it_depends_on_to_settle() {
+            let line = "toggle the sidebar and then toggle the agent table";
+            let mut app = app_with(
+                line,
+                &["toggle the sidebar", "toggle the agent table"],
+                Some(vec![vec![], vec![0]]),
+            );
+            assert!(matches!(phase(&app, 1), Phase::Waiting));
+            let g = generation(&app, 0);
+            app.commander_read(g, line, reading(Command::Act(Action::ToggleSidebar), 0.9));
+            assert!(matches!(phase(&app, 0), Phase::Settling(_)));
+            assert!(matches!(phase(&app, 1), Phase::Waiting));
+            assert!(
+                matches!(&app.state.commander.reading, Some(Ok(said)) if said.starts_with("✓ toggle the sidebar · 1 of 2 done"))
+            );
+
+            app.pump_paragraph(Instant::now() + Duration::from_secs(1));
+            assert!(matches!(phase(&app, 0), Phase::Done));
+            assert!(matches!(phase(&app, 1), Phase::Reading(_)));
+            let context = app.state.commander.paragraph.as_ref().unwrap().context(1).0;
+            assert_eq!(context[0].did, "toggle the sidebar");
+        }
+
+        #[test]
+        fn an_unsure_command_pauses_only_itself() {
+            let line = "zoom and show the agent table";
+            let mut app = app_with(
+                line,
+                &["zoom", "show the agent table"],
+                Some(vec![vec![], vec![]]),
+            );
+            let (first, second) = (generation(&app, 0), generation(&app, 1));
+            app.commander_read(first, line, reading(Command::Act(Action::Zoom), 0.3));
+            app.commander_read(
+                second,
+                line,
+                reading(Command::Act(Action::ToggleAgentTable), 0.9),
+            );
+            assert!(matches!(phase(&app, 1), Phase::Settling(_)));
+            assert!(
+                matches!(&app.state.commander.reading, Some(Ok(said)) if said.starts_with("step 1 of 2: toggle zoom?"))
+            );
+            app.submit_commander();
+            assert!(app.state.commander.paragraph.is_none());
+        }
+
+        #[test]
+        fn until_the_plan_arrives_only_the_first_command_starts() {
+            let line = "zoom and show help";
+            let mut app = app_with(line, &["zoom", "show help"], None);
+            app.state.commander.paragraph.as_mut().unwrap().planning = Some(77);
+            assert!(matches!(phase(&app, 0), Phase::Reading(_)));
+            assert!(matches!(phase(&app, 1), Phase::Waiting));
+
+            // A failed plan runs the commands in the order written.
+            app.commander_ordered(77, line, Err("no claude".into()));
+            let paragraph = app.state.commander.paragraph.as_ref().unwrap();
+            assert_eq!(paragraph.after, Some(vec![vec![], vec![0]]));
+            assert!(matches!(phase(&app, 1), Phase::Waiting));
+        }
+
+        #[test]
+        fn an_answer_arriving_mid_command_is_handled_after_it() {
+            let line = "zoom and show the agent table";
+            let mut app = app_with(
+                line,
+                &["zoom", "show the agent table"],
+                Some(vec![vec![], vec![]]),
+            );
+            let (first, second) = (generation(&app, 0), generation(&app, 1));
+            // The second answer comes in while the first command is being
+            // carried out, as it does when that command goes through the
+            // socket API, which handles pending events part way through.
+            app.commander_deferred
+                .push(crate::events::AppEvent::CommanderRead {
+                    generation: second,
+                    line: line.into(),
+                    result: Err("no pane here goes by that name".into()),
+                });
+            app.commander_read(first, line, reading(Command::Act(Action::Zoom), 0.9));
+            assert!(app.commander_deferred.is_empty());
+            // Handled, not lost: the fixed reading of the line is offered.
+            assert!(matches!(phase(&app, 1), Phase::Held { .. }));
+        }
+
+        fn two_spaces() -> App {
+            let mut app = test_app();
+            app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+            app.state.active = Some(0);
+            app.state.commander.frame = ratatui::layout::Rect::new(0, 0, 100, 40);
+            app.state.view.terminal_area = ratatui::layout::Rect::new(20, 2, 80, 36);
+            crate::app::input::open_commander(&mut app.state);
+            app
+        }
+
+        /// Run the frame clock until no star carries anything.
+        fn fly(app: &mut App) {
+            let mut now = Instant::now();
+            for _ in 0..2000 {
+                app.sync_commander_clock(now);
+                now += Duration::from_millis(16);
+                app.tick_commander(now);
+                if !app
+                    .state
+                    .commander
+                    .flights
+                    .iter()
+                    .any(|f| f.cargo.is_some())
+                {
+                    return;
+                }
+            }
+            panic!("a star never landed");
+        }
+
+        fn space_entry(ws: usize, label: &str) -> crate::commander::intent::Entry {
+            crate::commander::intent::Entry {
+                kind: crate::commander::intent::Kind::Space,
+                ws,
+                tab: 0,
+                pane: None,
+                label: label.into(),
+                context: None,
+                names: Vec::new(),
+                locality: 0,
+            }
+        }
+
+        #[test]
+        fn a_switch_happens_when_its_star_lands() {
+            let mut app = two_spaces();
+            let (_, flight) = app.dispatch(Command::Go(space_entry(1, "two")), true);
+            assert!(flight.is_some());
+            assert_eq!(
+                app.state.active,
+                Some(0),
+                "switched before the star arrived"
+            );
+            fly(&mut app);
+            assert_eq!(app.state.active, Some(1));
+        }
+
+        #[test]
+        fn focusing_an_agent_in_another_space_waits_for_its_star() {
+            let mut app = two_spaces();
+            let pane = app.state.workspaces[1].focused_pane_id().unwrap();
+            let entry = crate::commander::intent::Entry {
+                kind: crate::commander::intent::Kind::Pane,
+                pane: Some(pane),
+                ..space_entry(1, "Emily")
+            };
+            let (_, flight) = app.dispatch(Command::Go(entry), true);
+            assert!(flight.is_some());
+            assert_eq!(
+                app.state.active,
+                Some(0),
+                "switched before the star arrived"
+            );
+            fly(&mut app);
+            assert_eq!(app.state.active, Some(1));
+        }
+
+        #[test]
+        fn next_space_happens_when_its_star_lands_on_that_space() {
+            let mut app = two_spaces();
+            let (_, flight) = app.dispatch(Command::Act(Action::NextSpace), true);
+            assert!(flight.is_some());
+            assert_eq!(app.state.active, Some(0), "moved before the star arrived");
+            let star = app.state.commander.flights.last().expect("a star");
+            assert_eq!(
+                star.aim,
+                crate::commander::Aim::Space {
+                    workspace_id: app.state.workspaces[1].id.clone()
+                }
+            );
+            fly(&mut app);
+            assert_eq!(app.state.active, Some(1));
+        }
+
+        #[test]
+        fn the_star_lands_without_a_burst() {
+            use crate::commander::trail::{Trail, V2};
+            let frame = ratatui::layout::Rect::new(0, 0, 60, 20);
+            let mut trail = Trail::new(V2::from_cell(30, 18), V2::from_cell(5, 2), frame);
+            while !trail.update(1.0 / 60.0, 60, 20) {}
+            let mut buf = ratatui::buffer::Buffer::empty(frame);
+            trail.render(frame, &mut buf);
+            let stars = buf
+                .content
+                .iter()
+                .filter(|c| c.symbol() == "*" || c.symbol() == "+")
+                .count();
+            assert_eq!(stars, 0, "nothing thrown out where it landed");
+        }
+
+        #[test]
+        fn a_panel_toggle_sends_no_star() {
+            let mut app = two_spaces();
+            app.dispatch(Command::Act(Action::ToggleSidebar), true);
+            assert!(app.state.commander.flights.is_empty());
+        }
+
+        #[test]
+        fn stars_aim_at_the_name_the_label_and_the_card() {
+            use crate::app::state::{PaneTitleHitArea, WorkspaceCardArea};
+            use crate::commander::{trail::V2, Aim};
+            use ratatui::layout::Rect;
+            let mut app = two_spaces();
+            let pane = crate::layout::PaneId::from_raw(9);
+            app.state.view.pane_title_hit_areas = vec![PaneTitleHitArea {
+                pane_id: pane,
+                rect: Rect::new(10, 5, 12, 1),
+            }];
+            // Past the corner and dash, at the middle of the name.
+            assert_eq!(app.aim_point(&Aim::Pane(pane)), V2::from_cell(17, 5));
+
+            app.state.view.tab_hit_areas = vec![Rect::new(30, 1, 10, 1)];
+            let id = app.state.workspaces[0].id.clone();
+            assert_eq!(
+                app.aim_point(&Aim::Tab {
+                    workspace_id: id,
+                    tab: 0
+                }),
+                V2::center_of(Rect::new(30, 1, 10, 1))
+            );
+
+            app.state.view.workspace_card_areas = vec![WorkspaceCardArea {
+                ws_idx: 1,
+                rect: Rect::new(1, 4, 20, 3),
+                indented: false,
+            }];
+            let id = app.state.workspaces[1].id.clone();
+            let card = app.aim_point(&Aim::Space { workspace_id: id });
+            assert_eq!(card.y, V2::from_cell(0, 5).y, "the card's name row");
+
+            // A message goes where the pane takes input: with no cursor to
+            // read, the middle of the pane.
+            let shown = crate::layout::PaneId::from_raw(10);
+            app.state.view.pane_infos = vec![crate::layout::PaneInfo {
+                id: shown,
+                rect: Rect::new(40, 10, 20, 10),
+                inner_rect: Rect::new(41, 11, 18, 8),
+                scrollbar_rect: None,
+                is_focused: false,
+                exposed: Default::default(),
+            }];
+            assert_eq!(
+                app.aim_point(&Aim::Input(shown)),
+                V2::center_of(Rect::new(41, 11, 18, 8))
+            );
+
+            // An agent whose pane is not on screen is reached at its name
+            // in the sidebar list.
+            let listed = crate::layout::PaneId::from_raw(11);
+            app.state.view.agent_row_areas = vec![crate::app::state::AgentRowArea {
+                ws_idx: 1,
+                tab_idx: 0,
+                pane_id: listed,
+                rect: Rect::new(1, 20, 24, 2),
+                location_header: false,
+            }];
+            assert_eq!(
+                app.aim_point(&Aim::Pane(listed)),
+                V2::from_cell(
+                    crate::ui::listed_name_column(Rect::new(1, 20, 24, 2)) + 2,
+                    20
+                )
+            );
+
+            // A pane with no place on screen falls back to the middle.
+            let lost = crate::layout::PaneId::from_raw(99);
+            assert_eq!(
+                app.aim_point(&Aim::Pane(lost)),
+                V2::center_of(app.state.view.terminal_area)
+            );
+        }
+
+        #[test]
+        fn escape_abandons_what_has_not_run() {
+            let mut app = app_with("a and b", &["a", "b"], Some(vec![vec![], vec![0]]));
+            app.commander_key(crate::input::TerminalKey::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::empty(),
+            ));
+            assert!(app.state.commander.paragraph.is_none());
+        }
+    }
+
+    #[test]
+    fn settings_acknowledge_on_pane_focus_saves_and_applies_both_ways() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-acknowledge-on-pane-focus");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n[ui]\nconfirm_close = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        app.state.mode = Mode::Settings;
+        app.state.settings.section = state::SettingsSection::Experiments;
+        app.state.settings.list.selected = state::ExperimentSetting::ALL
+            .iter()
+            .position(|setting| *setting == state::ExperimentSetting::AcknowledgeOnPaneFocus)
+            .unwrap();
+        assert!(!app.state.acknowledge_on_pane_focus);
+        for enabled in [true, false] {
+            if enabled {
+                app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+            } else {
+                app.state.view.terminal_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+                let area = app.state.settings_content_rect();
+                app.handle_mouse(crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column: area.x + 2,
+                    row: area.y
+                        + crate::ui::EXPERIMENTS_CHECKBOX_ROWS_OFFSET
+                        + app.state.settings.list.selected as u16,
+                    modifiers: KeyModifiers::empty(),
+                });
+            }
+            assert_eq!(app.state.acknowledge_on_pane_focus, enabled);
+            let saved: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved.ui.acknowledge_on_pane_focus, enabled);
+            assert!(!saved.ui.confirm_close);
+            assert!(!app.state.workspaces[0].pane_state(pane_id).unwrap().seen);
+            assert!(app.state.config_diagnostic.is_none());
+        }
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn acknowledge_on_focus_config_loads_and_reloads_without_confirming_a_pane() {
+        let mut config = Config::default();
+        config.ui.acknowledge_on_pane_focus = true;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        assert!(app.state.acknowledge_on_pane_focus);
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("acknowledge-on-focus-reload");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .values_mut()
+            .next()
+            .unwrap()
+            .seen = false;
+        for enabled in [true, false] {
+            std::fs::write(
+                &path,
+                format!("[ui]\nacknowledge_on_pane_focus = {enabled}\n"),
+            )
+            .unwrap();
+            app.reload_config();
+            assert_eq!(app.state.acknowledge_on_pane_focus, enabled);
+            assert!(
+                !app.state.workspaces[0].tabs[0]
+                    .panes
+                    .values()
+                    .next()
+                    .unwrap()
+                    .seen
+            );
+        }
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn settings_save_refresh_summary_prompt_persists_then_applies_live_config() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-save-refresh-summary-prompt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        app.state.refresh_summary_prompt = "Name this in three words.".into();
+        app.save_refresh_summary_prompt();
+
+        assert_eq!(
+            app.state.refresh_summary_prompt,
+            "Name this in three words."
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[ui]"));
+        assert!(content.contains("refresh_summary_prompt = \"Name this in three words.\""));
+        assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn settings_save_pane_history_persists_then_applies_live_config() {
         let _guard = config_env_lock().lock().unwrap();
@@ -2218,6 +3094,40 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[experimental]"));
         assert!(content.contains("pane_history = true"));
+        assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn settings_save_pane_header_field_persists_then_applies_live_config() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-save-pane-header");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(!app.state.pane_header.git_branch);
+
+        app.save_pane_header_field(crate::config::PaneHeaderField::GitBranch, true);
+
+        assert!(app.state.pane_header.git_branch);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[ui.pane_header]"));
+        assert!(content.contains("git_branch = true"));
+
+        // The usage field is off by default and round trips both ways.
+        assert!(!app.state.pane_header.usage);
+        app.save_pane_header_field(crate::config::PaneHeaderField::Usage, true);
+        assert!(app.state.pane_header.usage);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("usage = true"));
+        app.save_pane_header_field(crate::config::PaneHeaderField::Usage, false);
+        assert!(!app.state.pane_header.usage);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("usage = false"));
         assert!(app.state.config_diagnostic.is_none());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -2712,9 +3622,7 @@ mod tests {
         assert_eq!(resolved.terminal_id, terminal_id.to_string());
     }
 
-    fn app_with_peeked_hidden_agent(
-        title_name: &str,
-    ) -> (
+    fn app_with_peeked_hidden_agent() -> (
         App,
         crate::layout::PaneId,
         tokio::sync::mpsc::Receiver<bytes::Bytes>,
@@ -2741,7 +3649,6 @@ mod tests {
                 .get_mut(&terminal_id)
                 .expect("hidden terminal");
             terminal.set_agent_name("codex".into());
-            terminal.title_name = Some(title_name.into());
         }
         app.state.workspaces[0].layout.focus_pane(hidden);
         app.state.close_pane();
@@ -2757,13 +3664,13 @@ mod tests {
             .build()
             .expect("test runtime");
         let _runtime_guard = rt.enter();
-        let (app, hidden, _input_rx) = app_with_peeked_hidden_agent("peeked-lander");
+        let (app, hidden, _input_rx) = app_with_peeked_hidden_agent();
         let name = crate::ui::agent_panel_entries(&app.state)
             .into_iter()
             .find(|entry| entry.pane_id == hidden)
             .expect("hidden table row")
             .name;
-        assert_eq!(name, "peeked-lander");
+        assert!(!name.is_empty());
 
         let resolved = app
             .resolve_terminal_target(&name)
@@ -2781,7 +3688,7 @@ mod tests {
             .build()
             .expect("test runtime");
         let _runtime_guard = rt.enter();
-        let (mut app, hidden, mut input_rx) = app_with_peeked_hidden_agent("peeked-lander");
+        let (mut app, hidden, mut input_rx) = app_with_peeked_hidden_agent();
         let name = crate::ui::agent_panel_entries(&app.state)
             .into_iter()
             .find(|entry| entry.pane_id == hidden)
@@ -4037,5 +4944,37 @@ last_pane = "prefix+tab"
             &input[events[1].start..events[1].start + events[1].len],
             b"a"
         );
+    }
+    #[test]
+    fn settings_save_usage_switches_persist_then_apply_live_config() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-save-usage-switch");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(!app.state.usage_config.table);
+        assert!(app.state.usage_config.sidebar);
+        for switch in crate::config::UsageSwitch::ALL {
+            app.save_usage_switch(switch, false);
+        }
+        assert!(!app.state.usage_config.table);
+        assert!(!app.state.usage_config.sidebar);
+        assert!(!app.state.usage_config.alerts);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[ui.usage]"));
+        assert!(content.contains("table = false"));
+        assert!(content.contains("sidebar = false"));
+        assert!(content.contains("alerts = false"));
+
+        // And back on, through the same file.
+        app.save_usage_switch(crate::config::UsageSwitch::Table, true);
+        assert!(app.state.usage_config.table);
+        assert!(!app.state.usage_config.sidebar);
+        assert!(app.state.usage_table_on());
+        assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
     }
 }

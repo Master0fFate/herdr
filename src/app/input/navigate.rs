@@ -511,12 +511,18 @@ pub(crate) enum NavigateAction {
     RenameWorkspace,
     CloseWorkspace,
     SwitchWorkspace(usize),
+    SwitchTab(usize),
     FocusAgent(usize),
     WorkspacePicker,
     PreviousWorkspace,
     NextWorkspace,
     PreviousAgent,
     NextAgent,
+    NewTab,
+    RenameTab,
+    PreviousTab,
+    NextTab,
+    CloseTab,
     RenamePane,
     FocusPaneLeft,
     FocusPaneDown,
@@ -543,7 +549,9 @@ pub(crate) enum NavigateAction {
     Detach,
     OpenNavigator,
     OpenComposer,
+    OpenCommander,
     ToggleSidebar,
+    ToggleAgentTable,
 }
 
 fn indexed_navigation_action(
@@ -557,6 +565,13 @@ fn indexed_navigation_action(
         BindingDispatch::Prefix => binding.trigger.is_prefix(),
     };
 
+    for binding in &kb.switch_tab {
+        if trigger_matches(binding) {
+            if let Some(idx) = binding.matched_index(key) {
+                return Some(NavigateAction::SwitchTab(idx));
+            }
+        }
+    }
     for binding in &kb.switch_workspace {
         if trigger_matches(binding) {
             if let Some(idx) = binding.matched_index(key) {
@@ -637,7 +652,14 @@ fn action_for_key(
         (&kb.detach, NavigateAction::Detach),
         (&kb.goto, NavigateAction::OpenNavigator),
         (&kb.composer, NavigateAction::OpenComposer),
+        (&kb.commander, NavigateAction::OpenCommander),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
+        (&kb.toggle_agent_table, NavigateAction::ToggleAgentTable),
+        (&kb.new_tab, NavigateAction::NewTab),
+        (&kb.rename_tab, NavigateAction::RenameTab),
+        (&kb.previous_tab, NavigateAction::PreviousTab),
+        (&kb.next_tab, NavigateAction::NextTab),
+        (&kb.close_tab, NavigateAction::CloseTab),
     ] {
         if action_matches(bindings, &key, dispatch) {
             return Some(action);
@@ -847,9 +869,47 @@ pub(super) fn execute_navigate_action_in_context(
         }
         NavigateAction::OpenNavigator => state.open_navigator_from(terminal_runtimes),
         NavigateAction::OpenComposer => super::enter_composer_mode(state, terminal_runtimes),
+        NavigateAction::OpenCommander => super::open_commander(state),
+        NavigateAction::SwitchTab(idx) => {
+            let tab_exists = state
+                .active
+                .and_then(|ws_idx| state.workspaces.get(ws_idx))
+                .is_some_and(|ws| idx < ws.tabs.len());
+            if tab_exists {
+                state.switch_tab(idx);
+                leave_navigate_mode(state);
+            }
+        }
+        NavigateAction::NewTab => {
+            if state.active.is_some() {
+                if state.prompt_new_tab_name {
+                    super::modal::open_new_tab_dialog(state);
+                } else {
+                    state.request_new_tab = true;
+                    leave_navigate_mode(state);
+                }
+            }
+        }
+        NavigateAction::RenameTab => super::modal::open_rename_active_tab(state, false),
+        NavigateAction::PreviousTab => {
+            state.previous_tab();
+            leave_navigate_mode(state);
+        }
+        NavigateAction::NextTab => {
+            state.next_tab();
+            leave_navigate_mode(state);
+        }
+        NavigateAction::CloseTab => {
+            if !state.close_tab() {
+                leave_navigate_mode(state);
+            }
+        }
         NavigateAction::ToggleSidebar => {
-            state.sidebar_collapsed = !state.sidebar_collapsed;
-            state.mark_session_dirty();
+            state.toggle_shown(&crate::app::view::Fold::Sidebar);
+            leave_navigate_mode(state);
+        }
+        NavigateAction::ToggleAgentTable => {
+            state.toggle_shown(&crate::app::view::Fold::AgentTable);
             leave_navigate_mode(state);
         }
     }
@@ -1512,9 +1572,9 @@ navigate_pane_right = "ctrl+l"
         state.active = Some(0);
         state.selected = 0;
         state.mode = Mode::Navigate;
-        // Four more rows than the switcher needs: the composer band takes the
-        // top four, leaving the same short viewport this test is about.
-        crate::ui::compute_view(&mut state, ratatui::layout::Rect::new(0, 0, 44, 12));
+        // Two more rows than the switcher needs: the composer band and the
+        // blank row under it, leaving the same short viewport this test is about.
+        crate::ui::compute_view(&mut state, ratatui::layout::Rect::new(0, 0, 44, 10));
         assert_eq!(state.mobile_switcher_scroll, 0);
 
         handle_navigate_key(

@@ -326,6 +326,36 @@ pub(super) fn open_rename_workspace(
     state.mode = Mode::RenameWorkspace;
 }
 
+pub(super) fn open_rename_active_tab(state: &mut AppState, replace_on_type: bool) {
+    state.rename_pane_target = None;
+    if let Some(ws) = state.active.and_then(|i| state.workspaces.get(i)) {
+        if let Some(name) = ws.active_tab_display_name() {
+            state.name_input = name;
+            state.name_input_replace_on_type = replace_on_type;
+            state.mode = Mode::RenameTab;
+        }
+    }
+}
+
+pub(super) fn open_rename_tab(state: &mut AppState, ws_idx: usize, tab_idx: usize) {
+    if ws_idx >= state.workspaces.len() {
+        return;
+    }
+    if state
+        .workspaces
+        .get(ws_idx)
+        .is_none_or(|ws| tab_idx >= ws.tabs.len())
+    {
+        return;
+    }
+    state.selected = ws_idx;
+    state.active = Some(ws_idx);
+    state.switch_tab(tab_idx);
+    open_rename_active_tab(state, false);
+}
+
+pub(super) use super::describe_dialog::open_new_tab_dialog;
+
 pub(super) fn open_rename_pane(state: &mut AppState, pane_id: crate::layout::PaneId) {
     let Some(terminal_id) = terminal_id_for_pane(state, pane_id) else {
         return;
@@ -339,8 +369,49 @@ pub(super) fn open_rename_pane(state: &mut AppState, pane_id: crate::layout::Pan
     state.mode = Mode::RenamePane;
 }
 
+pub(super) fn refresh_summary(state: &mut AppState, pane_id: crate::layout::PaneId) {
+    if state.refresh_summary_with_grok() {
+        state.request_refresh_summary = Some(pane_id);
+        leave_modal(state);
+        return;
+    }
+    apply_heuristic_summary(state, pane_id);
+    leave_modal(state);
+}
+
+fn apply_heuristic_summary(state: &mut AppState, pane_id: crate::layout::PaneId) {
+    let Some(terminal_id) = state.terminal_id_for_any_pane(pane_id) else {
+        return;
+    };
+    let Some(title) = heuristic_summary_title(state, &terminal_id) else {
+        return;
+    };
+    if let Some(terminal) = state.terminals.get_mut(&terminal_id) {
+        terminal.adopt_probed_title(Some(title), true);
+        state.mark_session_dirty();
+    }
+}
+
+fn heuristic_summary_title(
+    state: &AppState,
+    terminal_id: &crate::terminal::TerminalId,
+) -> Option<String> {
+    let terminal = state.terminals.get(terminal_id)?;
+    let (agent, session_id) = terminal.model_probe_session()?;
+    let job = crate::agent_model::AgentModelRefreshJob {
+        terminal_id: terminal_id.clone(),
+        agent,
+        session_id,
+        cached: None,
+    };
+    crate::agent_model::refresh_agent_model_infos(vec![job])
+        .into_iter()
+        .next()
+        .and_then(|result| result.entry.title)
+}
+
 fn land_agent_prompt_target(state: &AppState, pane_id: crate::layout::PaneId) -> String {
-    crate::ui::agent_panel_entries(state)
+    crate::ui::all_agent_panel_entries(state)
         .into_iter()
         .find(|entry| entry.pane_id == pane_id)
         .map(|entry| entry.name)
@@ -418,6 +489,24 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                     crate::logging::workspace_renamed(&workspace_id);
                     state.mark_session_dirty();
                 }
+                Mode::RenameTab => {
+                    if let Some(ws_idx) = state.active {
+                        if let Some(ws) = state.workspaces.get_mut(ws_idx) {
+                            let workspace_id = ws.id.clone();
+                            let active_tab = ws.active_tab;
+                            if let Some(tab) = ws.active_tab_mut() {
+                                let keep_auto_name =
+                                    tab.is_auto_named() && new_name == tab.number.to_string();
+                                if !new_name.is_empty() && !keep_auto_name {
+                                    tab.set_custom_name(new_name);
+                                    let tab_id = format!("{}:{}", workspace_id, active_tab + 1);
+                                    crate::logging::tab_renamed(&workspace_id, &tab_id);
+                                    state.mark_session_dirty();
+                                }
+                            }
+                        }
+                    }
+                }
                 Mode::RenamePane => {
                     if let Some(pane_id) = state.rename_pane_target {
                         if let Some(terminal_id) = terminal_id_for_pane(state, pane_id) {
@@ -430,7 +519,6 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                 }
                 _ => {}
             }
-            state.creating_new_tab = false;
             state.rename_pane_target = None;
             state.name_input.clear();
             state.name_input_replace_on_type = false;
@@ -441,8 +529,6 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
             state.name_input_replace_on_type = false;
         }
         ModalAction::Cancel => {
-            state.creating_new_tab = false;
-            state.requested_new_tab_name = None;
             state.rename_pane_target = None;
             state.name_input.clear();
             state.name_input_replace_on_type = false;
@@ -659,20 +745,41 @@ pub(super) fn apply_context_menu_action(
                 .and_then(|ws| ws.worktree_space())
                 .map(|space| space.key.clone())
             {
-                if collapsed {
-                    state.collapsed_space_keys.remove(&key);
-                } else {
-                    state.collapsed_space_keys.insert(key);
-                }
-                state.mark_session_dirty();
+                state.set_shown(&crate::app::view::Fold::SpaceGroup(key), collapsed);
             }
             leave_modal(state);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("New tab")) => {
+            state.selected = ws_idx;
+            state.active = Some(ws_idx);
+            state.switch_tab(tab_idx);
+            open_new_tab_dialog(state);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Rename")) => {
+            open_rename_tab(state, ws_idx, tab_idx);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Edit goal")) => {
+            super::open_tab_goal_editor(state, ws_idx, tab_idx);
+        }
+        (ContextMenuKind::Tab { ws_idx, tab_idx }, Some("Close")) => {
+            state.selected = ws_idx;
+            state.active = Some(ws_idx);
+            state.switch_tab(tab_idx);
+            if !state.close_tab() {
+                leave_modal(state);
+            }
         }
         (
             ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Rename"),
         ) => {
             open_rename_workspace(state, terminal_runtimes, ws_idx);
+        }
+        (
+            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Edit purpose"),
+        ) => {
+            super::open_space_purpose_editor(state, ws_idx);
         }
         (
             ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
@@ -707,16 +814,14 @@ pub(super) fn apply_context_menu_action(
         | (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
             open_rename_pane(state, pane_id);
         }
+        (ContextMenuKind::Agent { pane_id, .. }, Some("Refresh Summary")) => {
+            refresh_summary(state, pane_id);
+        }
         (ContextMenuKind::Pane { pane_id, .. }, Some("Clear pane name")) => {
-            if let Some(ws_idx) = state.active {
-                if let Some(ws) = state.workspaces.get(ws_idx) {
-                    if let Some(pane) = ws.pane_state(pane_id) {
-                        let terminal_id = pane.attached_terminal_id.clone();
-                        if let Some(terminal) = state.terminals.get_mut(&terminal_id) {
-                            terminal.clear_manual_label();
-                            state.mark_session_dirty();
-                        }
-                    }
+            if let Some(terminal_id) = state.terminal_id_for_any_pane(pane_id) {
+                if let Some(terminal) = state.terminals.get_mut(&terminal_id) {
+                    terminal.clear_manual_label();
+                    state.mark_session_dirty();
                 }
             }
             state.mode = Mode::Terminal;
@@ -1169,6 +1274,135 @@ mod tests {
             Some((name, land_prompt_text()))
         );
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn refresh_summary_from_the_row_menu_takes_the_current_prompt() {
+        let _guard = crate::integration::integration_env_lock();
+        let session_id = "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c";
+        let root = std::env::temp_dir().join(format!(
+            "herdr-refresh-summary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = root.join("sessions").join("cwd").join(session_id);
+        std::fs::create_dir_all(&session).unwrap();
+        let grok_user_line = |text: &str| {
+            format!(
+                r#"{{"type":"user","content":[{{"type":"text","text":{}}}]}}"#,
+                serde_json::to_string(text).unwrap()
+            )
+        };
+        std::fs::write(
+            session.join("chat_history.jsonl"),
+            format!(
+                "{}\n{}\n",
+                grok_user_line("<user_query>\nImprove Agent Summary to be useful\n</user_query>"),
+                grok_user_line("<user_query>\nLand this on parent\n</user_query>")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            session.join("summary.json"),
+            r#"{"generated_title":"Improve Agent Summary to be useful","current_model_id":"grok-4.6"}"#,
+        )
+        .unwrap();
+        std::env::set_var("GROK_HOME", &root);
+
+        let mut state = state_with_workspaces(&["test"]);
+        state.ensure_test_terminals();
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+        {
+            let terminal = state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("agent terminal");
+            terminal.set_session_title(Some("Improve Agent Summary to be useful".into()));
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:grok".into(),
+                agent: "grok".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
+        }
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Agent {
+                ws_idx: 0,
+                pane_id,
+                space: SpaceMenuKind::Plain,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| item == "Refresh Summary")
+            .expect("refresh summary item");
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
+
+        assert_eq!(state.mode, Mode::Terminal);
+        let terminal = state.terminals.get(&terminal_id).expect("agent terminal");
+        assert_eq!(
+            terminal.session_title.as_deref(),
+            Some("Land this on parent"),
+            "Refresh Summary takes the current prompt, not the first one"
+        );
+        assert_eq!(terminal.manual_summary, None);
+
+        std::env::remove_var("GROK_HOME");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_summary_with_grok_queues_a_headless_session() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.ensure_test_terminals();
+        state.refresh_summary_with_grok = true;
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.terminal_id_for_pane(0, pane_id).unwrap();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("agent terminal")
+            .set_session_title(Some("Improve Agent Summary to be useful".into()));
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Agent {
+                ws_idx: 0,
+                pane_id,
+                space: SpaceMenuKind::Plain,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| item == "Refresh Summary")
+            .expect("refresh summary item");
+        let mut terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+
+        apply_context_menu_action(&mut state, &mut terminal_runtimes, menu, idx);
+
+        assert_eq!(state.mode, Mode::Terminal);
+        assert_eq!(state.request_refresh_summary, Some(pane_id));
+        assert_eq!(
+            state
+                .terminals
+                .get(&terminal_id)
+                .expect("agent terminal")
+                .session_title
+                .as_deref(),
+            Some("Improve Agent Summary to be useful"),
+            "the grok -p summary is filled when the headless session returns"
+        );
     }
 
     #[test]

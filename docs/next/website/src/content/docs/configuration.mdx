@@ -118,7 +118,7 @@ The default is relative to the source repository: Herdr creates checkouts under 
 
 `verify` is an optional program-and-arguments array. The land action runs it in the agent worktree after rebasing and before the parent checkout advances. An empty array skips verification. `auto_land` queues the same landing whenever an agent in a linked worktree becomes idle; it defaults to `false`, so landing stays explicit until you have seen the verification command work for that repository.
 
-Worktree actions are available from agent-table rows. `New worktree` creates a branch and checkout and opens it as a new Herdr space. `Open worktree...` lists existing Git worktree checkouts for that repository. Composer-launched editing agents use managed worktrees when the Worktree box between Directory and Agent is checked and their selected directory is a repository, and stay in that checkout when it is already a linked worktree. A worktree start stays hidden and opens in peek over the current layout instead of opening a space of its own. The hidden row still opens the agent menu, including Land and `Delete agent + worktree`. Drag the row, or the peeked pane name, onto the layout behind it to dock. Clear the box to start in the selected directory; that agent is cut in beside the pane that had focus.
+Worktree actions are available from agent-table rows. `New worktree` creates a branch and checkout and opens it as a new Herdr space. `Open worktree...` lists existing Git worktree checkouts for that repository. Composer-launched editing agents use managed worktrees when the Worktree box between Directory and Agent is checked and their selected directory is a repository, and stay in that checkout when it is already a linked worktree. A worktree start stays hidden and opens in peek over the current layout instead of opening a space of its own. Escape or EXIT leaves the peek. The hidden row still opens the agent menu, including Land and `Delete agent + worktree`. Drag the row, or the peeked pane name, onto the layout behind it to dock. Clear the box to start in the selected directory; that agent is cut in beside the pane that had focus.
 
 The land item on a linked worktree row is named for the branch currently checked out in the parent of that agent's folder, such as `Land on main`. Choosing it prompts that agent with `Land this clean branch by running \`herdr agent worktree land\``. The item stays visible but is grayed out when the worktree already shares that parent commit and has nothing left to land, or when the agent is not in a linked worktree directory. `herdr agent worktree land` rebases onto the parent branch, runs `verify`, and fast-forwards the parent checkout. A parent checkout's row still says `Delete agent`, which ends the agent and leaves the directory alone. `Delete agent + worktree` stays at the bottom of the menu on every agent row and is grayed out unless that agent's directory is a linked worktree. Choosing it removes that agent's checkout, even when the space holding the row has no saved worktree membership. The `!` next to a directory means that checkout has uncommitted files; a dirty parent checkout blocks the fast-forward. A conflict stays in the agent worktree. Herdr serializes CLI landings for one repository so agents cannot race to move the same parent branch.
 
@@ -162,6 +162,7 @@ detach = "prefix+q"
 workspace_picker = "prefix+w"
 goto = "prefix+g"
 composer = "prefix+/"
+commander = "f2"
 new_workspace = "prefix+shift+n"
 new_worktree = "prefix+shift+g"
 rename_workspace = "prefix+shift+w"
@@ -208,7 +209,26 @@ next_tab = ["prefix+n", "ctrl+alt+]"]
 
 `last_pane` switches back to the last focused pane across workspaces and tabs. It is unset by default because the tmux-style pane binding `prefix+l` is already used for pane-right focus.
 
-Key strings accept plain keys, modifier combinations such as `ctrl+a`, `shift+n`, `alt+1`, `cmd+k`, and special keys such as `enter`, `tab`, `esc`, `left`, `right`, `up`, and `down`. Named punctuation such as `minus`, `comma`, `ampersand`, `plus`, and `backtick` is also accepted. Plain direct printable keys such as `n` are unsafe because they intercept typing; use `prefix+n` unless you intentionally want a direct binding. The `navigate_workspace_*` and `navigate_pane_*` fields are navigate-mode-only and may use plain keys such as `j` or `k`; they must not use `prefix+`, `esc`, `enter`, `tab`, `shift+tab`, `left`, `right`, or unmodified `1` through `9`. Left and right arrows are permanent aliases for pane-left and pane-right navigation. These navigate-mode shortcuts are independent from general action bindings such as `focus_pane_down = "prefix+j"`; when both use the same key, the navigate-mode shortcut wins while navigate mode is open. Alt, Cmd/Super, and punctuation with modifiers depend on your terminal and tmux settings.
+Key strings accept plain keys, modifier combinations such as `ctrl+a`, `shift+n`, `alt+1`, `cmd+k`, and special keys such as `enter`, `tab`, `esc`, `left`, `right`, `up`, and `down`. Named punctuation such as `minus`, `comma`, `ampersand`, `plus`, and `backtick` is also accepted. A modifier key on its own can be named too: `right_alt`, `left_alt`, `right_ctrl`, `left_ctrl`, `right_shift`, `left_shift`, `right_super`, and `left_super`. Most terminals never report a modifier key pressed alone, so such a binding only fires in a terminal that sends the tap as its own key, as the kitty keyboard protocol numbers it (`ESC [ 57449 u` for Right Alt). Plain direct printable keys such as `n` are unsafe because they intercept typing; use `prefix+n` unless you intentionally want a direct binding. The `navigate_workspace_*` and `navigate_pane_*` fields are navigate-mode-only and may use plain keys such as `j` or `k`; they must not use `prefix+`, `esc`, `enter`, `tab`, `shift+tab`, `left`, `right`, or unmodified `1` through `9`. Left and right arrows are permanent aliases for pane-left and pane-right navigation. These navigate-mode shortcuts are independent from general action bindings such as `focus_pane_down = "prefix+j"`; when both use the same key, the navigate-mode shortcut wins while navigate mode is open. Alt, Cmd/Super, and punctuation with modifiers depend on your terminal and tmux settings.
+
+`commander` opens the Commander, a box at the bottom of the frame that turns a typed line into a herdr action or a message for a pane. It is the one direct shortcut on by default, and it is a function key because a terminal never receives the keyboard's Fn key itself. Settings has a `commander` tab that rebinds it: press `Enter`, then the new key, and it is written to `config.toml`.
+
+### Commander and Jev
+
+```toml
+[commander]
+jev_api_key = "your TypeSafe API key"
+jev_model = "jev-latest"
+planner_model = "claude-opus-5-5"
+```
+
+Without a key, the Commander reads a line by fixed phrases and names. With a key, it asks Jev, TypeSafe's model, what the line means. `TYPESAFE_API_KEY` in the environment is used when `jev_api_key` is unset. Settings → commander has a `jev key` row: press `Enter`, paste or type the key, and press `Enter` again to write it to `config.toml`. Saving it empty removes it.
+
+Jev chooses among everything herdr and its CLI can do: showing a space, tab, or pane; sending a pane a message, typed text, or a key such as `ctrl+c`; splitting, zooming, and resizing; opening a tab or space with a name; starting an agent such as Claude Code or Codex in a space, on a task; closing or renaming a space, tab, or pane; making, removing, or landing a worktree; folding away or showing the sidebar, its spaces section, a space's agents, a worktree group, the minimaps, or the agent table, the same parts `herdr view` changes; and herdr's own panels. The first request asks which kind of thing the line wants and which space, tab, and pane it names. The second asks which action within each kind that is still likely, and which words of the line are the message, name, task, or branch. Those words are cut from the line as typed, so a message arrives exactly as written. A reading that is sure and cannot lose work runs at once. Anything else, including every close, worktree removal, and land, is said under the field and waits for a second `Enter`. When Jev cannot be reached, the fixed reading is offered in its place.
+
+Every command that changes something on screen sends a star from the box to what it acts on, with or without a key, and the command happens when the star lands there. A message, typed text, or a key flies to that pane's cursor, where what is typed goes, or to the middle of the pane when the cursor is outside it. A switch flies to the space's card in the sidebar or the tab's label in the tab bar, and next or previous flies to the one it goes to. A rename or close flies to what it names. A split, zoom, resize, focus move, or started agent flies to the focused pane's name. A new tab flies to the tab bar's `+`, and a new space to the sidebar's `+ new`. A worktree command flies to its space's card. A place that is not on screen is aimed at the nearest place that is: an agent or pane in another tab or space at its name in the sidebar list or the agent table, then at its tab's label, and a tab in another space at that space's card. So focusing an agent elsewhere reaches its name before anything switches. The star leaves a thin streak that fades and only tints the text it crosses; nothing bursts where it lands. Opening and closing herdr's own panels sends no star and happens at once.
+
+With a key, one line can hold several commands: `switch to the fifth space and add a Claude Code agent, then prompt it to audit the last five diffs from this week, and tell the Grok agent to check the status of the PR`. Jev first finds where one command ends and the next begins. An `and` inside a message stays part of that message. A headless Claude Code then works out which commands must wait for which, using the model in `planner_model`, which is `claude-opus-5-5` by default. It runs with no tools, no hooks and no saved session. The first command starts while it thinks. Every command whose waits are over then runs, so commands that wait for nothing run at the same time. In that example the Grok message goes at once, the agent is added once the switch is done, and the audit prompt waits for that agent. Each command is read against what is on screen by then and what the commands it waits for did, so `it` means the agent just started. A command that waits for another waits until that one's message has landed and any agent it started is at its prompt, for up to 30 seconds. If that agent is stuck on a question of its own, such as whether to trust its folder, the rest stops and a toast names what was not run. In a line of several commands, a message does not switch the screen to its pane, so it cannot move the screen out from under a command running alongside it. A command that needs a second `Enter` waits for it without holding up the commands that do not depend on it. `Esc` or an edit abandons the commands not yet run; the ones already run stay done. When `claude` is not installed or the planner fails, or `planner_model = ""`, the commands run in the order written, one at a time.
 
 If you have old custom keybindings and want the new defaults, run `herdr config reset-keys`. Herdr backs up `config.toml`, removes `[keys]` and `[[keys.command]]`, and uses built-in v2 defaults after restart or `herdr server reload-config`.
 
@@ -293,10 +313,14 @@ hide_cursor_when_unfocused = true
 mouse_scroll_lines = 3
 confirm_close = true
 prompt_new_tab_name = true
+acknowledge_on_pane_focus = false
 show_agent_labels_on_pane_borders = false
 agent_panel_scope = "all"
 accent = "cyan"
 notify_active_tab = false
+refresh_summary_with_grok = false
+hide_attached_agents = false
+refresh_summary_prompt = "In 5-8 words, name the most recent thing the user asked this AI to do. Reply with only that sentence."
 ```
 
 `sidebar_min_width` and `sidebar_max_width` control the expanded sidebar's resize bounds in columns. The defaults are 18 and 36.
@@ -306,6 +330,8 @@ notify_active_tab = false
 `agent_panel_scope` can be `all` or `current`. Use `current` if you only want the agent panel to show agents in the active workspace.
 
 `confirm_close` controls whether closing a workspace asks for confirmation. `prompt_new_tab_name` controls whether new tabs ask for a label first.
+
+Set `[ui] acknowledge_on_pane_focus = true` to confirm a finished agent when you click or focus its pane, including keyboard navigation, switching tabs or spaces, and opening an agent peek. The default is `false`, which keeps confirmation manual. Settings → experiments exposes the same preference as `acknowledge completion on pane focus`; changing it saves the config and applies it immediately. Only the focused agent is confirmed, not other panes in the same tab. Clicking an already focused pane also confirms it. The action is idempotent and leaves working or blocked agents alone. Finishing while already focused does not automatically confirm a new response: focus or click the pane again. Reloading the config changes future focus actions without clearing existing markers.
 
 Set `mouse_capture = false` if you want your terminal to handle normal clicks, such as command-clicking URLs. With mouse capture enabled, Ctrl-click opens pane links when your terminal sends that modified click to Herdr; use Shift-Ctrl-click on Linux or Shift-Cmd-click on macOS for the terminal-native bypass path.
 
@@ -320,6 +346,58 @@ When your terminal reports focus (xterm focus reporting, mode 1004), Herdr mutes
 Set `mouse_scroll_lines` to change how many pane scrollback lines each mouse wheel notch scrolls. The default is 3. Pane apps that request mouse reporting still receive wheel events directly.
 
 Set `show_agent_labels_on_pane_borders = true` if you want detected agent labels in split pane borders when no manual pane label is set.
+
+Each pane's top edge can write more than the agent name. These default to the status mark and the name:
+
+```toml
+[ui.pane_header]
+status = true
+agent_name = true
+hostname = false
+working_directory = false
+parent_directory = false
+git_branch = false
+git_status = false
+usage = false
+```
+
+`status` draws the agent's status mark before everything else, the same mark the agent table shows: a spinner while it works, a diamond while it waits on an answer, and a blinking dot once it finishes, which a click turns into a steady check and back. The dot blinks even in the focused pane until acknowledged, using the same rhythm as an inactive tab awaiting attention. A pane with no agent has no mark. `working_directory` is the last folder of the pane's cwd. `parent_directory` is the folder above it. Both together write `parent/current`, the same pair the agent table's Directory column uses. `git_branch` and `git_status` follow in parentheses when the pane is in a repository (`main !`). `hostname` writes the name of the machine the pane is on next to the pane name (`Olivia@myhost`), or alone if `agent_name` is off. That is the local machine's hostname, except while `ssh` is the program running in the pane: then it is the machine ssh connected to, read from its command line, so `ssh aaron@king` shows `Olivia@king`. A Tailscale name keeps only its machine part, so `tailscale ssh king` also shows `king` rather than `king.<tailnet>.ts.net`. Any other destination shows as typed, including an ssh config alias. The title returns to the local hostname when ssh exits. Settings → pane labels toggles the same keys.
+
+`usage` is off by default. Set `usage = true`, or turn on usage in Settings, pane labels. When it is on, it draws the allowance meters of the provider of the agent in that pane (Claude, GPT or Cursor), after git status: ten squares for the share left, the percent, and a countdown to the reset such as `4/h`. At 20% left the squares turn pink, at 10% red. A reading older than 15 minutes is dimmed. A narrow pane drops the squares first, then the weekly meter, and keeps the two-letter label until only the countdown fits. A pane with no agent shows nothing. Cursor's header meter is the tighter of its two pools, labelled `cm` (Cursor models, the Auto pool) or `om` (other models). There is no header tooltip, so the other pool is not drawn on that line.
+
+The sidebar lists the meters for each provider that has an agent open, under the spaces list. That block is on by default. Cursor draws two rows there, `cm` and `om`, each with the shared monthly reset. The table row reads `cm` then `om`, the same shape as Claude's `5h` and `wk`. Spoken lines say "Cursor models" and "Cursor other models". JSON window kinds stay `auto` and `named`. A passed reset keeps the percent the provider reported and marks the window reset, and the meter draws full and idle. The agent table's Allowance column is off until you set `table = true`, or turn on "usage in the agent table" in Settings, pane labels. With `cursor_pools = "both"` (the default) that column draws both Cursor pools. `cursor_pools = "tighter"` draws only the pool with less left, in the table and the sidebar. When the column is on and the row is short of room, it drops the squares first, then the second meter, and keeps the two-letter labels, all rows together. Each pool has its own low alert and its own recovery. The JSON note still includes overall. A spoken alert at 10% left is off (once per window; `SPEAK=0` in the environment silences it). Settings, pane labels lists these keys under the header fields. `herdr view usage hide` turns the table, the headers and the sidebar off together for the session, without changing these keys:
+
+```toml
+[ui.usage]
+table = false
+sidebar = true
+alerts = false
+alert_command = ""
+alert_on_recovery = true
+alert_pane = ""
+cursor_login = false
+claude_statusline = false
+cursor_pools = "both"
+# codex_home = "~/.codex"
+```
+
+`codex_home` is the first Codex home Herdr reads; unset, it is `$CODEX_HOME`, then `~/.codex`. Herdr also reads `$CODEX_HOME`, `~/.codex`, and the `CODEX_HOME` of every Codex process running in a pane (for example one started with a `codex-gpt` wrapper), and shows the newest reading. Readings that name different plans are never mixed: the home of a running pane decides, else `codex_home`. Usage state lives in Herdr's state directory under `usage/` (`$XDG_STATE_HOME/herdr/usage`, or `~/.local/state/herdr/usage`; debug builds use `herdr-dev`). Configure the Claude status line command as `herdr usage claude-statusline`.
+
+Alerts are off by default. `alert_command` is a whitespace-separated program and arguments, with the phrase appended as one final argument; no shell is used. Empty means macOS `say`, and silence on other platforms. `SPEAK=0` silences alerts.
+
+When alerts are on, `alert_on_recovery` is on by default. Set it false to keep only the low alert. With it on, the same command speaks once when a window that had reached 10% left resets, or when its remaining allowance climbs back above 10%. A reset says `GPT five hour allowance has reset`. A climb says `GPT five hour allowance is back, 40 percent left` (the same provider name the low alert uses, and the real remaining percent). A later refresh does not repeat it, and a window that was never low does not speak at startup. A recovery that happens while Herdr is not running is not announced. Herdr wakes at the stored reset time, plus a short margin, and treats that window as full again without waiting for the next provider reading. `alert_pane` is a pane name, such as `Eleanor`. When it is set, that pane also receives the recovery line. Empty sends nothing.
+
+On macOS, run `herdr usage cursor-login` and answer `[y/N]` to import cursor.com cookies from Chrome, Brave, Edge, Arc, Vivaldi, or Chromium into the `herdr-cursor-usage` Keychain item. This saves `cursor_login = true`. `--refresh` never prompts, `--status` shows consent and Keychain presence, and `--forget` removes the item and clears consent after confirming removal. Exit codes are 0 for success or declined consent, 1 for an error, 3 for missing consent (or unsupported platform), and 4 for a signed-out login. Linux automatic cookie import is deferred; use the paste-once flow below. Windows runtime remains unsupported. The app may refresh the login hourly on its worker; `herdr usage` and `--json` never import it. Settings can disable browser login; enabling automatic import requires the consent command. Pasted logins retain their source and are never replaced by automatic browser refresh.
+
+Saving a browser or pasted login clears the cached missing/expired-login message and makes the next Cursor reading due immediately. A running app picks this up on its next refresh, within the five-minute backstop; `herdr usage` can fetch it on the next invocation. Failed or declined saves leave the reading timer alone. The hourly automatic-import limit is unchanged.
+
+The Claude status line always records incoming usage for the allowance bars. Meters in that line are off by default, so it prints an empty line. Set `[ui.usage] claude_statusline = true` (also in Settings, pane labels) to print the meters. `herdr view usage hide` also hides the status line, using a tiny visibility marker saved by the server in Herdr's usage state directory, separately for each named session; `show` restores it if the config switch is on. A missing or unreadable marker defaults to shown; the status line never opens `session.json`, even if it is huge. Keep the status line process in the same `HERDR_SESSION` and config environment as its Herdr pane.
+
+Cursor login tries the macOS default HTTPS browser first when it has an unexpired cursor.com row, then the first supported browser with live matching rows. Profiles are checked Default then Profile directories. If no browser has matching rows, the first available store reports the signed-out result. `herdr usage cursor-login --browser Brave` forces a browser, and works with `--refresh`. Safari and Firefox are not supported yet; an unsupported default is named before trying supported browsers. `--status` reports the saved browser and selection reason (default, first signed in, explicit browser, or first available); records from older builds show an unknown reason until the next import. Selection runs a scoped live-row existence query returning only one bit; it never selects cookie values or ciphertext. Decryption is confined to importing the chosen store. Unsupported default browsers are named by their bundle ID, including defaults other than Safari and Firefox. Only stable browser roots are supported; Beta, Dev, Canary and other channel folders are not supported yet.
+
+`refresh_summary_with_grok` controls `Refresh Summary` on an agent row. Off (the default), Herdr reads the latest typed prompt from that agent's session log. On, it starts a headless `grok -p` session at `--effort none` that names the most recent user request. The column says `refreshing summary` until that session returns. For a Grok pane it forks that session so the live chat is not written. For other harnesses it passes the latest typed requests as prompt context. If Grok is missing or the one-shot fails, the command falls back to the session-log prompt. Settings → experiments toggles the same key and has a `prompt` field next to it for the text sent to Grok. `refresh_summary_prompt` is that text; empty uses the built-in 5–8 word ask.
+
+`hide_attached_agents` limits the agent table and the mobile agents list to agents that are not in any space: the ones set down out of every layout. Off (the default), both lists show every agent. Hidden agents keep their order; a drag or sort while they are hidden places them below the rows you arranged. The next and previous agent keys still cycle through them. Settings → experiments toggles the same key as `agent list: only agents not in a space`.
 
 ## Notifications
 
@@ -536,3 +614,14 @@ Common log files:
 ```
 
 Logs rotate automatically. Include the current log and rotated siblings when reporting issues.
+
+
+### Paste a Cursor login
+
+On macOS or Linux, run `herdr usage cursor-login --paste`. In your browser, sign in to cursor.com, open DevTools → Network, select a cursor.com request, and copy its Cookie header value. Paste only the value at Herdr's hidden prompt, then press Enter. The prompt requires an interactive terminal, does not echo input, and accepts at most 16 KiB. Ctrl-C cancels. Herdr checks the login against the usage-summary endpoint before saving it. A pasted login cannot refresh itself: on expiry or `--refresh`, paste again. The app's background worker never imports browser cookies over a pasted login.
+
+macOS stores the login in the existing `herdr-cursor-usage` Keychain item. Linux uses `secret-tool store` with Herdr-owned Secret Service attributes (`application=herdr`, `purpose=cursor-usage`); the value travels over stdin. Install the distribution's libsecret tools if needed. Native KWallet without a Secret Service interface is not supported yet.
+
+If the helper or Secret Service is unavailable, Herdr asks once before saving a **plaintext** fallback. Answering no saves nothing. The fallback is `usage/cursor-login/cookie` under Herdr's state directory (`$XDG_STATE_HOME/herdr`, normally `~/.local/state/herdr`; debug builds use `herdr-dev`). The credential folder is 0700 and the file is 0600. Symlink paths, hardlinks, special files and permissive existing credential files/folders are rejected. Locked, denied or timed-out keyring operations do not silently fall back. Existing plaintext storage is cleared after a successful keyring save. Forget clears only Herdr's keyring item and empties its fallback file; it never changes browser data. These permissions restrict access but do not encrypt the fallback.
+
+Linux default-browser discovery tries `xdg-settings get default-web-browser`, then `xdg-mime query default x-scheme-handler/https`, then mimeapps.list in XDG precedence. Desktop IDs are parsed as data; Exec entries are never run. Stable Chrome, Chromium, Brave, Edge and Vivaldi IDs are recognized; unknown IDs get a plain unsupported message. Discovery helpers share a three-second deadline. Recognition does not enable Linux cookie import: v10/v11 decryption and native Linux integration testing remain follow-up work.

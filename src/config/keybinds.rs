@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crossterm::event::KeyEvent;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -270,7 +270,9 @@ pub struct Keybinds {
     pub workspace_picker: ActionKeybinds,
     pub goto: ActionKeybinds,
     pub composer: ActionKeybinds,
+    pub commander: ActionKeybinds,
     pub toggle_sidebar: ActionKeybinds,
+    pub toggle_agent_table: ActionKeybinds,
     pub detach: ActionKeybinds,
     pub reload_config: ActionKeybinds,
     pub open_notification_target: ActionKeybinds,
@@ -279,7 +281,13 @@ pub struct Keybinds {
     pub previous_agent: ActionKeybinds,
     pub next_agent: ActionKeybinds,
     pub focus_agent: Vec<IndexedKeybind>,
+    pub new_tab: ActionKeybinds,
+    pub rename_tab: ActionKeybinds,
+    pub previous_tab: ActionKeybinds,
+    pub next_tab: ActionKeybinds,
+    pub switch_tab: Vec<IndexedKeybind>,
     pub switch_workspace: Vec<IndexedKeybind>,
+    pub close_tab: ActionKeybinds,
     pub rename_pane: ActionKeybinds,
     pub edit_scrollback: ActionKeybinds,
     pub copy_mode: ActionKeybinds,
@@ -445,7 +453,9 @@ impl Config {
             workspace_picker: action!("keys.workspace_picker", &self.keys.workspace_picker),
             goto: action!("keys.goto", &self.keys.goto),
             composer: action!("keys.composer", &self.keys.composer),
+            commander: action!("keys.commander", &self.keys.commander),
             toggle_sidebar: action!("keys.toggle_sidebar", &self.keys.toggle_sidebar),
+            toggle_agent_table: action!("keys.toggle_agent_table", &self.keys.toggle_agent_table),
             detach: action!("keys.detach", &self.keys.detach),
             reload_config: action!("keys.reload_config", &self.keys.reload_config),
             open_notification_target: action!(
@@ -457,7 +467,13 @@ impl Config {
             previous_agent: action!("keys.previous_agent", &self.keys.previous_agent),
             next_agent: action!("keys.next_agent", &self.keys.next_agent),
             focus_agent: indexed!("keys.focus_agent", &self.keys.focus_agent),
+            new_tab: action!("keys.new_tab", &self.keys.new_tab),
+            rename_tab: action!("keys.rename_tab", &self.keys.rename_tab),
+            previous_tab: action!("keys.previous_tab", &self.keys.previous_tab),
+            next_tab: action!("keys.next_tab", &self.keys.next_tab),
+            switch_tab: indexed!("keys.switch_tab", &self.keys.switch_tab),
             switch_workspace: indexed!("keys.switch_workspace", &self.keys.switch_workspace),
+            close_tab: action!("keys.close_tab", &self.keys.close_tab),
             rename_pane: action!("keys.rename_pane", &self.keys.rename_pane),
             edit_scrollback: action!("keys.edit_scrollback", &self.keys.edit_scrollback),
             copy_mode: action!("keys.copy_mode", &self.keys.copy_mode),
@@ -483,6 +499,13 @@ impl Config {
             custom_commands: Vec::new(),
         };
 
+        append_legacy_indexed_bindings(
+            &mut keybinds.switch_tab,
+            "keys.indexed.tabs",
+            &self.keys.indexed.tabs,
+            &mut registry,
+            &mut diagnostics,
+        );
         append_legacy_indexed_bindings(
             &mut keybinds.switch_workspace,
             "keys.indexed.workspaces",
@@ -874,6 +897,10 @@ pub fn format_key_combo(binding: KeyCombo) -> String {
         KeyCode::Up => "up".to_string(),
         KeyCode::Down => "down".to_string(),
         KeyCode::F(n) => format!("f{n}"),
+        KeyCode::Modifier(key) => match modifier_key_name(key) {
+            Some(name) => name.to_string(),
+            None => format!("{:?}", code).to_lowercase(),
+        },
         _ => format!("{:?}", code).to_lowercase(),
     };
 
@@ -895,6 +922,35 @@ fn super_modifier_label() -> &'static str {
     } else {
         "super"
     }
+}
+
+/// The modifier keys a binding can name on their own, such as `right_alt`.
+/// Most terminals never report a modifier key pressed alone; one that does
+/// sends it as its own key, the way the kitty keyboard protocol numbers them.
+const MODIFIER_KEY_NAMES: &[(ModifierKeyCode, &str)] = &[
+    (ModifierKeyCode::LeftShift, "left_shift"),
+    (ModifierKeyCode::RightShift, "right_shift"),
+    (ModifierKeyCode::LeftControl, "left_ctrl"),
+    (ModifierKeyCode::RightControl, "right_ctrl"),
+    (ModifierKeyCode::LeftAlt, "left_alt"),
+    (ModifierKeyCode::RightAlt, "right_alt"),
+    (ModifierKeyCode::LeftSuper, "left_super"),
+    (ModifierKeyCode::RightSuper, "right_super"),
+];
+
+fn modifier_key_name(key: ModifierKeyCode) -> Option<&'static str> {
+    MODIFIER_KEY_NAMES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, name)| *name)
+}
+
+fn modifier_key_from_name(name: &str) -> Option<ModifierKeyCode> {
+    let name = name.replace('-', "_");
+    MODIFIER_KEY_NAMES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(k, _)| *k)
 }
 
 fn parse_modifier_token(token: &str) -> Option<KeyModifiers> {
@@ -996,6 +1052,9 @@ pub(super) fn parse_key_combo(s: &str) -> Option<KeyCombo> {
         "ampersand" => KeyCode::Char('&'),
         "backtick" => KeyCode::Char('`'),
         "plus" => KeyCode::Char('+'),
+        name if modifier_key_from_name(name).is_some() => {
+            KeyCode::Modifier(modifier_key_from_name(name)?)
+        }
         _ if single_char.is_some() => {
             let ch = single_char?;
             if ch.is_ascii_uppercase() {
@@ -1038,6 +1097,12 @@ fn parse_key_combo_with_diagnostic(
 }
 
 pub fn normalize_key_combo((mut code, mut modifiers): KeyCombo) -> KeyCombo {
+    // A modifier key pressed on its own is the whole binding. A terminal may
+    // report that key's own modifier flag alongside it, and that flag says
+    // nothing the key does not.
+    if matches!(code, KeyCode::Modifier(_)) {
+        return (code, KeyModifiers::empty());
+    }
     if matches!(code, KeyCode::Tab) && modifiers.contains(KeyModifiers::SHIFT) {
         code = KeyCode::BackTab;
         modifiers.remove(KeyModifiers::SHIFT);
@@ -1175,7 +1240,7 @@ fn is_shifted_punctuation(ch: char) -> bool {
     )
 }
 
-fn is_unmodified_printable(combo: KeyCombo) -> bool {
+pub(crate) fn is_unmodified_printable(combo: KeyCombo) -> bool {
     matches!(combo.0, KeyCode::Char(ch) if !ch.is_control())
         && combo.1.difference(KeyModifiers::SHIFT).is_empty()
 }
@@ -1262,6 +1327,47 @@ prefix = "ö"
                 KeyModifiers::SHIFT
             ))]
         );
+    }
+
+    #[test]
+    fn a_lone_modifier_key_can_be_bound_and_matches_its_tap() {
+        let combo = parse_key_combo("right_alt").expect("right_alt parses");
+        assert_eq!(
+            combo,
+            (
+                KeyCode::Modifier(ModifierKeyCode::RightAlt),
+                KeyModifiers::empty()
+            )
+        );
+        assert_eq!(format_key_combo(combo), "right_alt");
+        // The tap Black Box sends: ESC [ 57449 u, with no modifier field.
+        let tap = crate::input::parse_terminal_key_sequence("\x1b[57449u").expect("tap parses");
+        assert!(terminal_key_matches_combo(&tap, combo));
+        // A terminal that also reports Alt as held still means the same key.
+        let with_flag = TerminalKey::new(
+            KeyCode::Modifier(ModifierKeyCode::RightAlt),
+            KeyModifiers::ALT,
+        );
+        assert!(terminal_key_matches_combo(&with_flag, combo));
+        assert!(!terminal_key_matches_combo(
+            &TerminalKey::new(KeyCode::Char('x'), KeyModifiers::ALT),
+            combo
+        ));
+    }
+
+    #[test]
+    fn right_alt_is_accepted_as_a_direct_binding() {
+        let mut config = Config::default();
+        config.keys.commander = BindingConfig::one("right_alt");
+        let diagnostics = config.collect_diagnostics();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(config
+            .keybinds()
+            .commander
+            .matches_direct_key(&TerminalKey::new(
+                KeyCode::Modifier(ModifierKeyCode::RightAlt),
+                KeyModifiers::empty()
+            )));
     }
 
     #[test]

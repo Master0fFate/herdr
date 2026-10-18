@@ -95,14 +95,31 @@ impl App {
         }
     }
 
-    pub(super) fn save_agent_border_labels(&mut self, enabled: bool) {
-        if self.update_config_file("agent border labels", |content| {
+    pub(super) fn save_pane_header_field(
+        &mut self,
+        field: crate::config::PaneHeaderField,
+        enabled: bool,
+    ) {
+        if self.update_config_file("pane header", |content| {
             crate::config::upsert_section_bool(
                 content,
-                "ui",
-                "show_agent_labels_on_pane_borders",
+                "ui.pane_header",
+                field.config_key(),
                 enabled,
             )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_usage_switch(&mut self, switch: crate::config::UsageSwitch, enabled: bool) {
+        if switch == crate::config::UsageSwitch::CursorLogin && enabled {
+            self.state.config_diagnostic =
+                Some("Run herdr usage cursor-login to allow browser login.".into());
+            return;
+        }
+        if self.update_config_file("usage display", |content| {
+            crate::config::upsert_section_bool(content, "ui.usage", switch.config_key(), enabled)
         }) {
             self.apply_config_from_disk(false);
         }
@@ -127,5 +144,82 @@ impl App {
         }) {
             self.apply_config_from_disk(false);
         }
+    }
+
+    pub(super) fn save_refresh_summary_with_grok(&mut self, enabled: bool) {
+        if self.update_config_file("refresh summary with grok", |content| {
+            crate::config::upsert_section_bool(content, "ui", "refresh_summary_with_grok", enabled)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_hide_attached_agents(&mut self, enabled: bool) {
+        if self.update_config_file("agent list filter", |content| {
+            crate::config::upsert_section_bool(content, "ui", "hide_attached_agents", enabled)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_acknowledge_on_pane_focus(&mut self, enabled: bool) {
+        if self.update_config_file("acknowledge completion on pane focus", |content| {
+            crate::config::upsert_section_bool(content, "ui", "acknowledge_on_pane_focus", enabled)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_commander_key(&mut self, combo: &str) {
+        if self.update_config_file("commander hotkey", |content| {
+            crate::config::upsert_section_value(
+                content,
+                "keys",
+                "commander",
+                &crate::config::toml_quoted_string(combo),
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    /// Write the Jev API key to `[commander]`, or take it out when empty.
+    pub(super) fn save_jev_api_key(&mut self, key: &str) {
+        if self.update_config_file("jev api key", |content| {
+            if key.is_empty() {
+                crate::config::remove_section_key(content, "commander", "jev_api_key")
+            } else {
+                crate::config::upsert_section_value(
+                    content,
+                    "commander",
+                    "jev_api_key",
+                    &crate::config::toml_quoted_string(key),
+                )
+            }
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn save_refresh_summary_prompt(&mut self) {
+        let prompt = self.state.refresh_summary_prompt();
+        if self.update_config_file("refresh summary prompt", |content| {
+            crate::config::upsert_section_value(
+                content,
+                "ui",
+                "refresh_summary_prompt",
+                &crate::config::toml_quoted_string(&prompt),
+            )
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
+    pub(super) fn flush_refresh_summary_prompt_save(&mut self) {
+        if !self.state.request_save_refresh_summary_prompt {
+            return;
+        }
+        self.state.request_save_refresh_summary_prompt = false;
+        self.save_refresh_summary_prompt();
     }
 }

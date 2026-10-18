@@ -32,6 +32,7 @@ use bytes::Bytes;
 
 use crate::api;
 use crate::app;
+use crate::app::state::PanePopOutRequest;
 use crate::config;
 use crate::events::AppEvent;
 use crate::ipc::{remove_socket_file_if_owned, socket_file_identity, SocketFileIdentity};
@@ -74,6 +75,13 @@ enum LoopEvent {
     Api(api::ApiRequestMessage),
     ServerEvent(ServerEvent),
     RenderRequested,
+}
+
+/// Whether this client draws the app inside a terminal that can open a pane
+/// in its own window. A direct terminal attach draws no pane titles.
+fn client_host_pops_out_panes(client: &ClientConnection) -> bool {
+    matches!(client.mode, ClientConnectionMode::App)
+        && client.host_terminal_program.as_deref() == Some(crate::black_box::TERM_PROGRAM)
 }
 
 fn rect_fits_frame(rect: Rect, frame: &FrameData) -> bool {
@@ -593,6 +601,7 @@ impl HeadlessServer {
         let Some(client_id) = self.foreground_client_id else {
             self.effective_size = (MIN_COLS, MIN_ROWS);
             self.app.state.outer_terminal_focus = None;
+            self.app.state.host_pops_out_panes = false;
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
@@ -602,6 +611,7 @@ impl HeadlessServer {
             self.foreground_client_id = None;
             self.effective_size = (MIN_COLS, MIN_ROWS);
             self.app.state.outer_terminal_focus = None;
+            self.app.state.host_pops_out_panes = false;
             let server_keybindings = self.server_keybindings.clone();
             apply_keybindings(&mut self.app, &server_keybindings);
             self.sync_visible_server_config_diagnostic(false);
@@ -610,6 +620,7 @@ impl HeadlessServer {
 
         let terminal_size = client.terminal_size;
         let outer_terminal_focus = client.outer_terminal_focus;
+        let host_pops_out_panes = client_host_pops_out_panes(client);
         let host_terminal_theme = client.host_terminal_theme;
         let uses_local_keybindings = client.keybindings.is_some();
         let keybindings = client
@@ -620,6 +631,7 @@ impl HeadlessServer {
 
         self.effective_size = terminal_size;
         self.app.state.outer_terminal_focus = outer_terminal_focus;
+        self.app.state.host_pops_out_panes = host_pops_out_panes;
         apply_keybindings(&mut self.app, &keybindings);
         self.sync_visible_server_config_diagnostic(uses_local_keybindings);
         if !host_terminal_theme.is_empty() {
@@ -1536,9 +1548,16 @@ impl HeadlessServer {
 
         if self.app.state.request_new_workspace {
             self.app.state.request_new_workspace = false;
-            self.app.create_workspace();
+            self.app.open_new_describe_dialog();
             needs_render = true;
             crate::render_prof::event("full_render_cause.deferred_new_workspace");
+        }
+
+        if self.app.state.request_submit_describe_dialog {
+            self.app.state.request_submit_describe_dialog = false;
+            self.app.create_space_from_dialog();
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_describe_dialog");
         }
 
         if self.app.state.request_new_tab {
@@ -1592,6 +1611,11 @@ impl HeadlessServer {
             self.app.submit_land_prompt(&target, &text);
             needs_render = true;
             crate::render_prof::event("full_render_cause.deferred_land_prompt");
+        }
+
+        if self.app.start_pending_summary_refresh() {
+            needs_render = true;
+            crate::render_prof::event("full_render_cause.deferred_refresh_summary");
         }
 
         if self.app.state.request_submit_worktree_create {
@@ -1713,6 +1737,36 @@ impl HeadlessServer {
 
     /// Sends a message to a specific client. Returns false if the client
     /// was not found or the send failed (client removed).
+    /// Sends a pane pop-out request to the client whose click asked for it,
+    /// when that client's terminal can open the window. The click came from
+    /// a POP control, which only a capable foreground client is shown, so a
+    /// refusal here means the client changed between drawing and clicking.
+    fn send_pane_pop_out(&mut self, client_id: u64, request: PanePopOutRequest) {
+        if !self
+            .clients
+            .get(&client_id)
+            .is_some_and(client_host_pops_out_panes)
+        {
+            debug!(
+                client_id,
+                "ignored pane pop-out for a client that cannot open windows"
+            );
+            return;
+        }
+        info!(client_id, terminal_id = %request.terminal_id, "pane pop-out requested");
+        self.send_to_client(
+            client_id,
+            ServerMessage::PopOutPane {
+                terminal_id: request.terminal_id,
+                title: request.title,
+                column: request.rect.x,
+                row: request.rect.y,
+                columns: request.rect.width,
+                rows: request.rect.height,
+            },
+        );
+    }
+
     fn send_to_client(&mut self, client_id: u64, msg: ServerMessage) -> bool {
         let serialized = match Self::frame_server_message(&msg) {
             Ok(framed) => framed,
@@ -1868,6 +1922,7 @@ impl HeadlessServer {
                 writer,
                 render_encoding,
                 direct_attach_requested,
+                host_terminal_program,
             } => {
                 if self.handoff_in_progress {
                     if let Ok(message) =
@@ -1911,6 +1966,9 @@ impl HeadlessServer {
                         Some(writer),
                     ),
                 );
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    client.host_terminal_program = host_terminal_program;
+                }
                 if !direct_attach_requested {
                     self.foreground_client_id = Some(client_id);
                 }
@@ -1999,6 +2057,9 @@ impl HeadlessServer {
                 let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
                 self.app
                     .route_client_events(events, self.foreground_client_id == Some(client_id));
+                if let Some(request) = self.app.state.pending_pane_pop_out.take() {
+                    self.send_pane_pop_out(client_id, request);
+                }
                 if self.app.take_config_reloaded_from_disk() {
                     self.reload_server_config(false);
                 } else {
@@ -3083,10 +3144,13 @@ impl HeadlessServer {
             changed = true;
         }
 
+        changed |= self.app.tick_commander(now);
         changed |= self.app.clear_due_selection_highlight(now);
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
+            self.app.start_usage_refresh_if_due(now);
+            changed |= self.app.usage_redraw_due(now);
             changed |= self.app.start_agent_model_refresh_if_due(now);
         }
 
@@ -3702,6 +3766,7 @@ mod tests {
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_keybindings)),
             direct_attach_requested: false,
+            host_terminal_program: None,
             writer: writer_a,
         }));
         assert_eq!(server.app.state.config_diagnostic, without_keybindings);
@@ -3715,6 +3780,7 @@ mod tests {
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal_program: None,
             writer: writer_b,
         }));
         assert_eq!(
@@ -3765,6 +3831,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: Some(Box::new(local_config.live_keybinds().unwrap())),
             direct_attach_requested: false,
+            host_terminal_program: None,
             writer: writer_a,
         }));
         server.app.state.mode = crate::app::Mode::Settings;
@@ -3785,6 +3852,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal_program: None,
             writer: writer_b,
         }));
         assert_eq!(
@@ -3818,6 +3886,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal_program: None,
             writer,
         }));
         assert!(server.clients.contains_key(&7));
@@ -3857,6 +3926,7 @@ next_tab = ""
             render_encoding,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal_program: None,
             writer,
         }));
 
@@ -3891,6 +3961,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal_program: None,
             writer,
         }));
 
@@ -3924,6 +3995,7 @@ next_tab = ""
             render_encoding: RenderEncoding::SemanticFrame,
             keybindings: None,
             direct_attach_requested: false,
+            host_terminal_program: None,
             writer,
         }));
         assert!(server.has_app_client());
@@ -3969,6 +4041,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal_program: None,
             writer,
         }));
         assert!(
@@ -5379,6 +5452,7 @@ next_tab = ""
             render_encoding: RenderEncoding::TerminalAnsi,
             keybindings: None,
             direct_attach_requested: true,
+            host_terminal_program: None,
             writer,
         }));
         assert!(

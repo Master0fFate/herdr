@@ -10,8 +10,6 @@
 
 use crate::net::UnixStream;
 use std::io;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;

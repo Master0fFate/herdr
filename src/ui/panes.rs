@@ -20,7 +20,18 @@ use unicode_width::UnicodeWidthStr;
 
 const PANE_BORDER_SET: ratatui::symbols::border::Set = ratatui::symbols::border::ROUNDED;
 const PANE_CLOSE_CONTROL_SUFFIX: &str = " ✕ ";
+const PANE_PEEK_CONTROLS: &str = " ◱ EXIT ";
+/// Leads the title controls when the host terminal can open the pane in its
+/// own window. Its cells are the POP click target.
+const PANE_POP_CONTROL: &str = " ⧉ POP";
 const PANE_INNER_PADDING: u16 = 0;
+
+#[derive(Clone, Copy)]
+enum PaneTitleMode {
+    Normal,
+    Zoomed,
+    Peeking,
+}
 
 struct PaneTitleChromeLayout {
     /// Width of the pane name/path details section (before the horizontal rule glyphs).
@@ -31,19 +42,22 @@ struct PaneTitleChromeLayout {
 fn pane_title_chrome_layout(
     title_width: u16,
     title: &PaneChromeTitle,
-    maximized: bool,
+    mode: PaneTitleMode,
     hide: bool,
+    pop: bool,
 ) -> PaneTitleChromeLayout {
-    let (_, controls_width) = pane_controls_text(title_width, maximized, hide);
-    let title_prefix_width = "╭─ ".chars().count();
+    let (_, controls_width) = pane_controls_text(title_width, mode, hide, pop);
+    let title_prefix_width = "╭─ ".chars().count() + title.status_width() as usize;
     let text_available = title_width
         .saturating_sub(title_prefix_width as u16)
         .saturating_sub(controls_width)
         .saturating_sub(3) as usize;
     let title_text = truncate_to_width(&title.formatted_title(), text_available);
     let details_width = (title_prefix_width + title_text.chars().count() + 1) as u16;
+    let usage_width = title_usage_width(title, text_available, title_text.chars().count());
     let rule_width = title_width
         .saturating_sub(details_width)
+        .saturating_sub(usage_width)
         .saturating_sub(controls_width)
         .saturating_sub(1);
     PaneTitleChromeLayout {
@@ -52,9 +66,36 @@ fn pane_title_chrome_layout(
     }
 }
 
-fn pane_controls_text(title_width: u16, maximized: bool, hide: bool) -> (&'static str, u16) {
-    let text = if title_width >= 24 {
-        match (maximized, hide) {
+/// Columns the usage meters take after the title text, with the space that
+/// follows them. They only use what the title text leaves free, so a long
+/// title is never cut for them.
+fn title_usage_width(title: &PaneChromeTitle, text_available: usize, title_cols: usize) -> u16 {
+    let Some(usage) = &title.usage else {
+        return 0;
+    };
+    let free = text_available.saturating_sub(title_cols).saturating_sub(1);
+    match super::usage_bar::header_width(usage, free) {
+        0 => 0,
+        meters => (meters + 1) as u16,
+    }
+}
+
+/// The title controls for a pane title `title_width` cells wide. `pop` adds
+/// POP in front of FOCUS or BACK when the title has room for it.
+fn pane_controls_text(
+    title_width: u16,
+    mode: PaneTitleMode,
+    hide: bool,
+    pop: bool,
+) -> (String, u16) {
+    let text = if matches!(mode, PaneTitleMode::Peeking) {
+        if title_width >= 12 {
+            PANE_PEEK_CONTROLS
+        } else {
+            ""
+        }
+    } else if title_width >= 24 {
+        match (matches!(mode, PaneTitleMode::Zoomed), hide) {
             (true, true) => " ◱ BACK  HIDE ",
             (true, false) => " ◱ BACK  ✕ ",
             (false, true) => " ⛶ FOCUS HIDE ",
@@ -69,11 +110,20 @@ fn pane_controls_text(title_width: u16, maximized: bool, hide: bool) -> (&'stati
     } else {
         ""
     };
-    (text, text.width() as u16)
+    let pop_fits = title_width >= 24 + PANE_POP_CONTROL.width() as u16;
+    let text = if pop && pop_fits && !matches!(mode, PaneTitleMode::Peeking) {
+        format!("{PANE_POP_CONTROL}{text}")
+    } else {
+        text.to_string()
+    };
+    let width = text.width() as u16;
+    (text, width)
 }
 
 fn pane_close_suffix(controls_text: &str) -> &str {
-    if controls_text.ends_with("HIDE ") {
+    if controls_text.ends_with("EXIT ") {
+        controls_text
+    } else if controls_text.ends_with("HIDE ") {
         " HIDE "
     } else {
         PANE_CLOSE_CONTROL_SUFFIX
@@ -92,10 +142,18 @@ fn pane_close_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> 
     Rect::new(start, area.y, end.saturating_sub(start).max(1), 1)
 }
 
+fn pane_pop_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> Option<Rect> {
+    controls_text
+        .starts_with(PANE_POP_CONTROL)
+        .then(|| Rect::new(controls_x, area.y, PANE_POP_CONTROL.width() as u16, 1))
+}
+
 fn pane_focus_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> Rect {
     let close = pane_close_control_rect(area, controls_x, controls_text);
-    let focus_width = close.x.saturating_sub(controls_x);
-    Rect::new(controls_x, area.y, focus_width, 1)
+    let focus_x = pane_pop_control_rect(area, controls_x, controls_text)
+        .map_or(controls_x, |pop| pop.x + pop.width);
+    let focus_width = close.x.saturating_sub(focus_x);
+    Rect::new(focus_x, area.y, focus_width, 1)
 }
 
 fn pane_content_rect(area: Rect, framed: bool) -> Rect {
@@ -346,13 +404,14 @@ fn compute_hidden_right_edge_ranges(
 fn pane_title_hit_area(
     area: Rect,
     title: &PaneChromeTitle,
-    maximized: bool,
+    mode: PaneTitleMode,
     hide: bool,
+    pop: bool,
 ) -> Option<Rect> {
     if area.width < 4 || area.height == 0 {
         return None;
     }
-    let layout = pane_title_chrome_layout(area.width, title, maximized, hide);
+    let layout = pane_title_chrome_layout(area.width, title, mode, hide, pop);
     Some(Rect::new(
         area.x,
         area.y,
@@ -370,17 +429,210 @@ fn pane_hides_instead_of_closing(
         .is_some_and(crate::terminal::TerminalState::is_agent_terminal)
 }
 
+/// The local machine's hostname, so a pane title can say which computer it's
+/// running on. Looked up once per process; a pane's own name never changes
+/// what computer herdr is running on.
+fn local_hostname() -> &'static str {
+    use std::sync::OnceLock;
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+    HOSTNAME.get_or_init(|| {
+        let mut buf = [0u8; 256];
+        // SAFETY: `buf` outlives the call and its length is passed as `len`.
+        let ok = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } == 0;
+        if !ok {
+            return String::new();
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).into_owned()
+    })
+}
+
+/// The machines the shown panes are logged into over ssh, computed once per
+/// frame from the live runtimes. Only the active tab's panes and a peeked agent
+/// get a title, so only they are looked up, and nothing is when the hostname
+/// field is off.
+pub(super) fn compute_ssh_hosts(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+) -> std::collections::HashMap<crate::layout::PaneId, String> {
+    let mut hosts = std::collections::HashMap::new();
+    if !app.pane_header().hostname {
+        return hosts;
+    }
+    let shown = app
+        .active
+        .and_then(|ws_idx| app.workspaces.get(ws_idx))
+        .map(|ws| ws.layout.pane_ids())
+        .unwrap_or_default();
+    for pane_id in shown.into_iter().chain(app.agent_peek) {
+        if let Some(host) = app
+            .runtime_for_agent_pane(terminal_runtimes, pane_id)
+            .and_then(|rt| rt.ssh_host())
+        {
+            hosts.insert(pane_id, host);
+        }
+    }
+    hosts
+}
+
+/// Folds a hostname into a pane name (`Olivia@myhost`), or stands in for it
+/// alone when the name field is off, so the two can be toggled independently.
+fn with_hostname(name: Option<String>, host: &str) -> Option<String> {
+    if host.is_empty() {
+        return name;
+    }
+    Some(match name {
+        Some(name) => format!("{name}@{host}"),
+        None => host.to_string(),
+    })
+}
+
 fn pane_chrome_title_for_pane(
     app: &AppState,
     ws: &Workspace,
     pane_id: crate::layout::PaneId,
 ) -> PaneChromeTitle {
     let terminal = app.terminal_state_for_pane(pane_id);
+    let header = app.pane_header();
     let assigned_name = terminal.and_then(|terminal| {
         crate::pane_names::assigned_names(&app.terminals).remove(&terminal.id)
     });
+    let mut name = header.agent_name.then(|| {
+        pane_name_label(terminal, assigned_name, ws.public_pane_number(pane_id))
+            .unwrap_or_else(|| "Workspace".to_string())
+    });
+    if header.hostname {
+        // The machine the pane's shell is on: the one ssh reached, or this one.
+        let host = match app.view.ssh_hosts.get(&pane_id) {
+            Some(host) => host.as_str(),
+            None => local_hostname(),
+        };
+        name = with_hostname(name, host);
+    }
+    let git_status = ws.git_status_for_pane(pane_id);
+    let path = pane_header_path(app, pane_id, terminal, &git_status);
+    let folder = path.as_deref().and_then(|path| {
+        header_folder_label(path, header.working_directory, header.parent_directory)
+    });
+    let in_repo = git_status.space.is_some()
+        || git_status
+            .branch
+            .as_deref()
+            .is_some_and(|branch| !branch.is_empty());
+    let branch = header
+        .git_branch
+        .then(|| git_branch_label(&git_status))
+        .flatten();
+    let status = (header.git_status && in_repo)
+        .then(|| worktree_state_marker(git_status.worktree_state).to_string());
     PaneChromeTitle {
-        folder_name: pane_name_label(terminal, assigned_name, ws.public_pane_number(pane_id)),
+        status: header
+            .status
+            .then(|| pane_status_mark(app, ws, pane_id, terminal))
+            .flatten(),
+        name,
+        folder,
+        git: git_suffix(branch.as_deref(), status.as_deref()),
+        usage: super::usage_bar::header_usage_for(
+            app,
+            terminal.and_then(|terminal| terminal.effective_known_agent()),
+        ),
+    }
+}
+
+/// The status mark for the agent in a pane, read from the same state the agent
+/// table reads. A pane with no agent in it has no mark.
+fn pane_status_mark(
+    app: &AppState,
+    ws: &Workspace,
+    pane_id: crate::layout::PaneId,
+    terminal: Option<&crate::terminal::TerminalState>,
+) -> Option<PaneStatusMark> {
+    let terminal = terminal.filter(|terminal| terminal.is_agent_terminal())?;
+    let pane = ws.pane_state(pane_id).or_else(|| {
+        app.detached_agents
+            .iter()
+            .find(|detached| detached.pane_id == pane_id)
+            .map(|detached| &detached.pane)
+    })?;
+    let docked = ws.pane_state(pane_id).is_some();
+    let (glyph, color) = super::agent_table::agent_status_marker(
+        app,
+        super::agent_table::AgentStatusMarks {
+            state: terminal.state,
+            seen: pane.seen,
+            completed: pane.completed,
+            landing: docked && app.landing_worktrees.contains(&ws.id),
+            land_failed: docked && app.landing_failures.contains_key(&ws.id),
+        },
+    )?;
+    let pending_completion = terminal.state == crate::detect::AgentState::Idle
+        && !pane.seen
+        && !(docked
+            && (app.landing_worktrees.contains(&ws.id)
+                || app.landing_failures.contains_key(&ws.id)));
+    let color = if pending_completion && !super::completion_blink_on(app.spinner_tick) {
+        mute_when_host_unfocused(app, app.palette.overlay0)
+    } else {
+        color
+    };
+    Some(PaneStatusMark {
+        glyph,
+        color,
+        clickable: terminal.state == crate::detect::AgentState::Idle
+            && (!pane.seen || pane.completed),
+    })
+}
+
+fn pane_header_path(
+    app: &AppState,
+    pane_id: crate::layout::PaneId,
+    terminal: Option<&crate::terminal::TerminalState>,
+    git_status: &crate::workspace::WorkspaceGitStatusSnapshot,
+) -> Option<String> {
+    if let Some(location) = app.view.agent_locations.get(&pane_id) {
+        return Some(location.path.clone());
+    }
+    let cwd = terminal.map(|terminal| terminal.cwd.as_path())?;
+    if cwd.as_os_str().is_empty() {
+        return None;
+    }
+    Some(display_location_path(cwd, git_status))
+}
+
+/// The folder text a pane header writes from a display path.
+///
+/// Working directory is the last folder. Parent directory is the folder above
+/// it. Both together are `parent/current`, the same pair the agent table uses.
+fn header_folder_label(path: &str, show_working: bool, show_parent: bool) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut parts = trimmed.rsplit('/');
+    let current = parts.next().filter(|part| !part.is_empty())?;
+    let parent = parts.next();
+    match (show_parent, show_working) {
+        (false, false) => None,
+        (false, true) => Some(current.to_string()),
+        (true, false) => match parent {
+            Some("") | None => None,
+            Some(parent) => Some(parent.to_string()),
+        },
+        (true, true) => Some(match parent {
+            Some("") => format!("/{current}"),
+            Some(parent) => format!("{parent}/{current}"),
+            None => current.to_string(),
+        }),
+    }
+}
+
+fn git_suffix(branch: Option<&str>, status: Option<&str>) -> Option<String> {
+    match (branch, status) {
+        (None, None) => None,
+        (Some(branch), Some(status)) => Some(format!("({branch} {status})")),
+        (Some(branch), None) => Some(format!("({branch})")),
+        (None, Some(status)) => Some(format!("({status})")),
     }
 }
 
@@ -432,8 +684,17 @@ fn render_pane_swap_drop_overlay(
         area,
     );
 
+    let source_in_layout = match app.drag.as_ref().map(|drag| &drag.target) {
+        Some(crate::app::state::DragTarget::PaneSwap { source_pane_id, .. }) => app
+            .view
+            .pane_infos
+            .iter()
+            .any(|pane| pane.id == *source_pane_id),
+        _ => true,
+    };
     let message = match zone {
-        crate::layout::DropZone::Over => "Drop to swap",
+        crate::layout::DropZone::Over if source_in_layout => "Drop to swap",
+        crate::layout::DropZone::Over => "Drop to move",
         crate::layout::DropZone::Edge(_) => "Drop to split",
     };
     let message_y = area.y + area.height.saturating_sub(1) / 2;
@@ -461,18 +722,28 @@ fn pane_chrome_controls(
     }
 
     let controls_x = pane_chrome_controls_x(area, controls_width);
-    vec![
-        PaneChromeControl {
-            pane_id,
-            action: PaneChromeAction::Close,
-            rect: pane_close_control_rect(area, controls_x, controls_text),
-        },
-        PaneChromeControl {
+    let close = PaneChromeControl {
+        pane_id,
+        action: PaneChromeAction::Close,
+        rect: pane_close_control_rect(area, controls_x, controls_text),
+    };
+    let focus_rect = pane_focus_control_rect(area, controls_x, controls_text);
+    let mut controls = vec![close];
+    if focus_rect.width > 0 {
+        controls.push(PaneChromeControl {
             pane_id,
             action: PaneChromeAction::Focus,
-            rect: pane_focus_control_rect(area, controls_x, controls_text),
-        },
-    ]
+            rect: focus_rect,
+        });
+    }
+    if let Some(rect) = pane_pop_control_rect(area, controls_x, controls_text) {
+        controls.push(PaneChromeControl {
+            pane_id,
+            action: PaneChromeAction::PopOut,
+            rect,
+        });
+    }
+    controls
 }
 
 pub(crate) fn pane_is_scrolled_back(rt: &TerminalRuntime) -> bool {
@@ -500,15 +771,87 @@ fn truncate_to_width(text: &str, width: usize) -> String {
 }
 
 struct PaneChromeTitle {
-    folder_name: Option<String>,
+    /// The agent's status mark, drawn before everything else on the title.
+    status: Option<PaneStatusMark>,
+    name: Option<String>,
+    folder: Option<String>,
+    git: Option<String>,
+    /// The allowance meters of this pane's provider, after git status.
+    usage: Option<super::usage_bar::HeaderUsage>,
+}
+
+/// The same mark the agent table draws in its margin, carried onto a pane's
+/// title. A finished agent's dot and its check are a button: clicking one
+/// turns it into the other, as it does in the table.
+#[derive(Clone, Copy)]
+struct PaneStatusMark {
+    glyph: &'static str,
+    color: Color,
+    clickable: bool,
 }
 
 impl PaneChromeTitle {
-    fn formatted_title(&self) -> String {
-        self.folder_name
-            .clone()
-            .unwrap_or_else(|| "Workspace".to_string())
+    #[cfg(test)]
+    fn name_only(name: impl Into<String>) -> Self {
+        Self {
+            status: None,
+            name: Some(name.into()),
+            folder: None,
+            git: None,
+            usage: None,
+        }
     }
+
+    /// Columns the status mark takes: the glyph and the space after it.
+    fn status_width(&self) -> u16 {
+        if self.status.is_some() {
+            2
+        } else {
+            0
+        }
+    }
+
+    fn formatted_title(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(name) = &self.name {
+            parts.push(name.as_str());
+        }
+        if let Some(folder) = &self.folder {
+            parts.push(folder.as_str());
+        }
+        if let Some(git) = &self.git {
+            parts.push(git.as_str());
+        }
+        parts.join(" ")
+    }
+}
+
+fn pane_title_spans(
+    title: &PaneChromeTitle,
+    truncated: &str,
+    name_style: Style,
+    rest_style: Style,
+) -> Vec<Span<'static>> {
+    if truncated.is_empty() {
+        return Vec::new();
+    }
+    if let Some(name) = &title.name {
+        if let Some(rest) = truncated.strip_prefix(name) {
+            let mut spans = vec![Span::styled(name.clone(), name_style)];
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest.to_string(), rest_style));
+            }
+            return spans;
+        }
+    }
+    vec![Span::styled(
+        truncated.to_string(),
+        if title.name.is_some() {
+            name_style
+        } else {
+            rest_style
+        },
+    )]
 }
 
 fn render_code_ui_pane_chrome(
@@ -519,7 +862,7 @@ fn render_code_ui_pane_chrome(
     pane_id: crate::layout::PaneId,
     focused: bool,
     highlighted: bool,
-    maximized: bool,
+    mode: PaneTitleMode,
     hide: bool,
     exposed: ExposedSides,
     hidden_right_edge_y: Option<(u16, u16)>,
@@ -528,8 +871,15 @@ fn render_code_ui_pane_chrome(
         return Vec::new();
     }
 
-    let edge_color = if focused || highlighted {
+    // Peek overlays a set-down agent; its chrome uses accent so it reads as a
+    // temporary view, not as the layout's focused pane (focus color).
+    let active_accent = if matches!(mode, PaneTitleMode::Peeking) {
+        mute_when_host_unfocused(app, app.palette.accent)
+    } else {
         focus_accent(app)
+    };
+    let edge_color = if focused || highlighted {
+        active_accent
     } else {
         app.palette.overlay0
     };
@@ -573,37 +923,64 @@ fn render_code_ui_pane_chrome(
     }
 
     let title_width = area.width;
-    let layout = pane_title_chrome_layout(title_width, &title, maximized, hide);
-    let (controls_text, controls_width) = pane_controls_text(title_width, maximized, hide);
+    let pop = app.host_pops_out_panes;
+    let layout = pane_title_chrome_layout(title_width, &title, mode, hide, pop);
+    let (controls_text, controls_width) = pane_controls_text(title_width, mode, hide, pop);
 
     let rule_glyph = '─';
     let unfocused_style = Style::default().fg(app.palette.overlay0).bg(Color::Reset);
     let pane_name_style = if chrome_active {
-        Style::default().fg(focus_accent(app)).bg(Color::Reset)
+        Style::default().fg(active_accent).bg(Color::Reset)
     } else {
         unfocused_style
     };
     let text_available = title_width
         .saturating_sub("╭─ ".chars().count() as u16)
+        .saturating_sub(title.status_width())
         .saturating_sub(controls_width)
         .saturating_sub(3) as usize;
     let title_text = truncate_to_width(&title.formatted_title(), text_available);
+    let rest_style = if chrome_active {
+        Style::default().fg(app.palette.overlay1).bg(Color::Reset)
+    } else {
+        unfocused_style
+    };
     let rule_text = if layout.rule_width > 0 {
         rule_glyph.to_string().repeat(layout.rule_width as usize)
     } else {
         String::new()
     };
 
-    let mut spans = vec![
-        Span::styled("╭─ ".to_string(), edge_style),
-        Span::styled(title_text, pane_name_style),
-    ];
+    let mut spans = vec![Span::styled("╭─ ".to_string(), edge_style)];
+    if let Some(mark) = title.status {
+        spans.push(Span::styled(
+            mark.glyph,
+            Style::default().fg(mark.color).bg(Color::Reset),
+        ));
+        spans.push(Span::styled(" ".to_string(), edge_style));
+    }
+    spans.extend(pane_title_spans(
+        &title,
+        &title_text,
+        pane_name_style,
+        rest_style,
+    ));
     spans.push(Span::styled(" ".to_string(), edge_style));
+    if let Some(usage) = &title.usage {
+        let free = text_available
+            .saturating_sub(title_text.chars().count())
+            .saturating_sub(1);
+        let meters = super::usage_bar::header_spans(usage, free, app.palette.overlay0);
+        if !meters.is_empty() {
+            spans.extend(meters);
+            spans.push(Span::styled(" ".to_string(), edge_style));
+        }
+    }
     if !rule_text.is_empty() {
         spans.push(Span::styled(rule_text, edge_style));
     }
     if !controls_text.is_empty() {
-        spans.push(Span::styled(controls_text, edge_style));
+        spans.push(Span::styled(controls_text.clone(), edge_style));
     }
 
     frame.render_widget(
@@ -611,7 +988,28 @@ fn render_code_ui_pane_chrome(
         Rect::new(area.x, area.y, area.width.saturating_sub(1), 1),
     );
 
-    pane_chrome_controls(area, pane_id, controls_text, controls_width)
+    pane_chrome_controls(area, pane_id, &controls_text, controls_width)
+}
+
+/// The click target over a finished agent's dot or check, which sits right
+/// after the title's opening corner. It covers the mark and the space after
+/// it, because many fonts draw the dot wider than one cell and it spills into
+/// that space. `None` when the pane has no mark a click can move.
+fn pane_status_control(
+    area: Rect,
+    pane_id: crate::layout::PaneId,
+    title: &PaneChromeTitle,
+) -> Option<PaneChromeControl> {
+    if area.width < 4 || area.height == 0 || !title.status.is_some_and(|mark| mark.clickable) {
+        return None;
+    }
+    let x = area.x + "╭─ ".chars().count() as u16;
+    let width = 2.min(area.right().saturating_sub(x));
+    Some(PaneChromeControl {
+        pane_id,
+        action: PaneChromeAction::Acknowledge,
+        rect: Rect::new(x, area.y, width, 1),
+    })
 }
 
 fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
@@ -627,7 +1025,22 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
     )
 }
 
-fn pane_name_label(
+/// The name a popped-out pane's window carries: the name its title shows,
+/// or "Terminal" when the pane has none.
+pub(crate) fn pane_pop_out_title(
+    app: &AppState,
+    ws: &Workspace,
+    pane_id: crate::layout::PaneId,
+) -> String {
+    let terminal = app.terminal_state_for_pane(pane_id);
+    let assigned_name = terminal.and_then(|terminal| {
+        crate::pane_names::assigned_names(&app.terminals).remove(&terminal.id)
+    });
+    pane_name_label(terminal, assigned_name, ws.public_pane_number(pane_id))
+        .unwrap_or_else(|| "Terminal".to_string())
+}
+
+pub(super) fn pane_name_label(
     terminal: Option<&crate::terminal::TerminalState>,
     assigned_name: Option<String>,
     pane_number: Option<usize>,
@@ -943,17 +1356,7 @@ pub(super) fn render_panes(
             // it. A swap takes the whole pane, and there is nothing left to see.
             let covers_pane = preview_zone == Some(crate::layout::DropZone::Over);
             if framed {
-                let terminal = app.terminal_state_for_pane(info.id);
-                let assigned_name = terminal.and_then(|terminal| {
-                    crate::pane_names::assigned_names(&app.terminals).remove(&terminal.id)
-                });
-                let title = PaneChromeTitle {
-                    folder_name: pane_name_label(
-                        terminal,
-                        assigned_name,
-                        ws.public_pane_number(info.id),
-                    ),
-                };
+                let title = pane_chrome_title_for_pane(app, ws, info.id);
                 render_code_ui_pane_chrome(
                     app,
                     frame,
@@ -962,7 +1365,13 @@ pub(super) fn render_panes(
                     info.id,
                     info.is_focused,
                     is_swap_preview,
-                    peeking || ws.zoomed,
+                    if peeking {
+                        PaneTitleMode::Peeking
+                    } else if ws.zoomed {
+                        PaneTitleMode::Zoomed
+                    } else {
+                        PaneTitleMode::Normal
+                    },
                     pane_hides_instead_of_closing(app, ws, info.id),
                     info.exposed,
                     hidden_right_edges.get(&info.id).copied(),
@@ -1034,18 +1443,31 @@ pub(super) fn compute_pane_chrome_controls(app: &AppState) -> Vec<PaneChromeCont
         return Vec::new();
     }
 
-    let zoomed = app.agent_peek.is_some() || ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
+    let peeking = app.agent_peek.is_some();
+    let mode = if peeking {
+        PaneTitleMode::Peeking
+    } else if ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false) {
+        PaneTitleMode::Zoomed
+    } else {
+        PaneTitleMode::Normal
+    };
 
     app.view
         .pane_infos
         .iter()
         .flat_map(|info| {
+            let title = pane_chrome_title_for_pane(app, ws, info.id);
+            let status = pane_status_control(info.rect, info.id, &title);
             let hide = pane_hides_instead_of_closing(app, ws, info.id);
-            let (controls_text, controls_width) = pane_controls_text(info.rect.width, zoomed, hide);
-            if controls_width == 0 || info.rect.height == 0 {
-                return Vec::new();
-            }
-            pane_chrome_controls(info.rect, info.id, controls_text, controls_width)
+            let (controls_text, controls_width) =
+                pane_controls_text(info.rect.width, mode, hide, app.host_pops_out_panes);
+            let mut controls = if controls_width == 0 || info.rect.height == 0 {
+                Vec::new()
+            } else {
+                pane_chrome_controls(info.rect, info.id, &controls_text, controls_width)
+            };
+            controls.extend(status);
+            controls
         })
         .collect()
 }
@@ -1066,16 +1488,15 @@ pub(super) fn compute_pane_title_hit_areas(app: &AppState) -> Vec<PaneTitleHitAr
             .and_then(|info| {
                 let title = pane_chrome_title_for_pane(app, ws, info.id);
                 let hide = pane_hides_instead_of_closing(app, ws, info.id);
-                pane_title_hit_area(info.rect, &title, true, hide).map(|rect| PaneTitleHitArea {
-                    pane_id: info.id,
-                    rect,
-                })
+                pane_title_hit_area(info.rect, &title, PaneTitleMode::Peeking, hide, false).map(
+                    |rect| PaneTitleHitArea {
+                        pane_id: info.id,
+                        rect,
+                    },
+                )
             })
             .into_iter()
             .collect();
-    }
-    if ws.layout.pane_count() <= 1 {
-        return Vec::new();
     }
 
     let zoomed = ws.active_tab().map(|tab| tab.zoomed).unwrap_or(false);
@@ -1089,7 +1510,14 @@ pub(super) fn compute_pane_title_hit_areas(app: &AppState) -> Vec<PaneTitleHitAr
         .filter_map(|info| {
             let title = pane_chrome_title_for_pane(app, ws, info.id);
             let hide = pane_hides_instead_of_closing(app, ws, info.id);
-            pane_title_hit_area(info.rect, &title, zoomed, hide).map(|rect| PaneTitleHitArea {
+            pane_title_hit_area(
+                info.rect,
+                &title,
+                PaneTitleMode::Normal,
+                hide,
+                app.host_pops_out_panes,
+            )
+            .map(|rect| PaneTitleHitArea {
                 pane_id: info.id,
                 rect,
             })
@@ -1526,27 +1954,541 @@ mod tests {
     }
 
     #[test]
+    fn header_folder_label_selects_parent_and_working_segments() {
+        assert_eq!(
+            header_folder_label("~/lab/herdr", true, false).as_deref(),
+            Some("herdr")
+        );
+        assert_eq!(
+            header_folder_label("~/lab/herdr", false, true).as_deref(),
+            Some("lab")
+        );
+        assert_eq!(
+            header_folder_label("~/lab/herdr", true, true).as_deref(),
+            Some("lab/herdr")
+        );
+        assert_eq!(header_folder_label("~/lab/herdr", false, false), None);
+        assert_eq!(
+            header_folder_label("herdr", true, false).as_deref(),
+            Some("herdr")
+        );
+        assert_eq!(header_folder_label("herdr", false, true), None);
+        assert_eq!(
+            header_folder_label("/herdr", true, true).as_deref(),
+            Some("/herdr")
+        );
+    }
+
+    #[test]
+    fn pane_chrome_title_joins_enabled_fields() {
+        let title = PaneChromeTitle {
+            status: None,
+            name: Some("Olivia".into()),
+            folder: Some("lab/herdr".into()),
+            git: git_suffix(Some("main"), Some("✓")),
+            usage: None,
+        };
+        assert_eq!(title.formatted_title(), "Olivia lab/herdr (main ✓)");
+        assert_eq!(
+            PaneChromeTitle {
+                status: None,
+                name: None,
+                folder: Some("herdr".into()),
+                git: git_suffix(Some("main"), None),
+                usage: None,
+            }
+            .formatted_title(),
+            "herdr (main)"
+        );
+        assert_eq!(
+            PaneChromeTitle::name_only("Olivia").formatted_title(),
+            "Olivia"
+        );
+        assert!(PaneChromeTitle {
+            status: None,
+            name: None,
+            folder: None,
+            git: None,
+            usage: None,
+        }
+        .formatted_title()
+        .is_empty());
+    }
+
+    #[test]
+    fn pane_chrome_title_for_pane_follows_header_toggles() {
+        let mut app = AppState::test_new();
+        let workspace = Workspace::test_new("test");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0]
+            .terminal_id(pane_id)
+            .expect("test workspace has a root terminal")
+            .clone();
+        let mut terminal = crate::terminal::TerminalState::new(
+            terminal_id.clone(),
+            std::path::PathBuf::from("/home/aaron/lab/herdr"),
+        );
+        terminal.set_manual_label("Olivia".into());
+        app.terminals.insert(terminal_id, terminal);
+        app.workspaces = vec![workspace];
+        app.workspaces[0].pane_git_statuses.insert(
+            pane_id,
+            WorkspaceGitStatusSnapshot {
+                branch: Some("main".into()),
+                ahead_behind: None,
+                space: None,
+                worktree_state: crate::workspace::GitWorktreeState::Unstaged,
+                landed: false,
+            },
+        );
+
+        assert_eq!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
+            "Olivia"
+        );
+
+        app.pane_header.working_directory = true;
+        app.pane_header.parent_directory = true;
+        let folder = header_folder_label(
+            &display_path_with_home(std::path::Path::new("/home/aaron/lab/herdr")),
+            true,
+            true,
+        )
+        .expect("parent/current folder");
+        assert_eq!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
+            format!("Olivia {folder}")
+        );
+
+        app.pane_header.git_branch = true;
+        app.pane_header.git_status = true;
+        assert_eq!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
+            format!("Olivia {folder} (main !)")
+        );
+
+        app.pane_header.agent_name = false;
+        assert_eq!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
+            format!("{folder} (main !)")
+        );
+
+        app.pane_header.agent_name = true;
+        app.pane_header.working_directory = false;
+        app.pane_header.parent_directory = false;
+        app.pane_header.git_branch = false;
+        app.pane_header.git_status = false;
+        app.pane_header.hostname = true;
+        let host = local_hostname();
+        let expected = if host.is_empty() {
+            "Olivia".to_string()
+        } else {
+            format!("Olivia@{host}")
+        };
+        assert_eq!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
+            expected
+        );
+
+        app.pane_header.agent_name = false;
+        let expected = if host.is_empty() {
+            String::new()
+        } else {
+            host.to_string()
+        };
+        assert_eq!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
+            expected
+        );
+
+        // A pane logged into another machine names that machine instead.
+        app.view.ssh_hosts.insert(pane_id, "king".into());
+        assert_eq!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
+            "king"
+        );
+        app.pane_header.agent_name = true;
+        assert_eq!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
+            "Olivia@king"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_pane_completion_blinks_without_losing_its_click_target() {
+        let (mut app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Codex));
+        app.active = Some(0);
+        let terminal_id = app.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().state = crate::detect::AgentState::Idle;
+        let pane = app.workspaces[0].pane_state_mut(pane_id).unwrap();
+        pane.seen = false;
+        pane.completed = true;
+        for tick in [0, 4, 8, 12] {
+            app.spinner_tick = tick;
+            let mark = pane_status_mark(
+                &app,
+                &app.workspaces[0],
+                pane_id,
+                app.terminals.get(&terminal_id),
+            )
+            .unwrap();
+            assert_eq!(mark.glyph, "●");
+            assert!(mark.clickable);
+            let expected = if super::super::completion_blink_on(tick) {
+                app.palette.green
+            } else {
+                app.palette.overlay0
+            };
+            assert_eq!(mark.color, expected);
+        }
+        assert!(app.toggle_agent_completion_acknowledgement(pane_id));
+        for tick in [0, 4] {
+            app.spinner_tick = tick;
+            let mark = pane_status_mark(
+                &app,
+                &app.workspaces[0],
+                pane_id,
+                app.terminals.get(&terminal_id),
+            )
+            .unwrap();
+            assert_eq!(mark.glyph, "✓");
+            assert_eq!(mark.color, app.palette.green);
+        }
+    }
+
+    fn usage_app_with_agent(
+        agent: Option<crate::detect::Agent>,
+    ) -> (AppState, crate::layout::PaneId) {
+        use crate::usage::{Provider, ProviderUsage, UsageSnapshot, UsageWindow, WindowKind};
+        let mut app = AppState::test_new();
+        let workspace = Workspace::test_new("test");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0]
+            .terminal_id(pane_id)
+            .expect("test workspace has a root terminal")
+            .clone();
+        let mut terminal = crate::terminal::TerminalState::new(
+            terminal_id.clone(),
+            std::path::PathBuf::from("/home/aaron/lab/herdr"),
+        );
+        terminal.set_manual_label("Olivia".into());
+        terminal.detected_agent = agent;
+        app.terminals.insert(terminal_id, terminal);
+        app.workspaces = vec![workspace];
+        app.usage_now = 1_000_000;
+        app.usage_snapshot = Some(UsageSnapshot {
+            version: 1,
+            taken_at: 1_000_000,
+            providers: vec![ProviderUsage {
+                provider: Provider::Claude,
+                windows: vec![
+                    UsageWindow {
+                        kind: WindowKind::FiveHour,
+                        left_pct: Some(70),
+                        resets_at: Some(1_000_000 + 3 * 3600 + 42 * 60),
+                        note: None,
+                        reset: false,
+                    },
+                    UsageWindow {
+                        kind: WindowKind::Weekly,
+                        left_pct: Some(80),
+                        resets_at: Some(1_000_000 + 4 * 86400 + 5 * 3600),
+                        note: None,
+                        reset: false,
+                    },
+                ],
+                seen_at: Some(1_000_000),
+                source: "test".into(),
+                problem: None,
+            }],
+        });
+        // Header meters and the table column are off by default. These tests
+        // draw the meters, then one of them turns the header off again.
+        app.pane_header.usage = true;
+        app.usage_config.table = true;
+        (app, pane_id)
+    }
+
+    #[test]
+    fn usage_follows_the_panes_agent_and_the_header_toggle() {
+        let (mut app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Claude));
+        let title = pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id);
+        assert!(title.usage.is_some());
+        // The meters sit after the title text; the text itself is unchanged.
+        assert_eq!(title.formatted_title(), "Olivia");
+
+        app.pane_header.usage = false;
+        assert!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id)
+                .usage
+                .is_none()
+        );
+
+        // An agent with no allowance reading, and a pane with no agent: no bars.
+        let (app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Codex));
+        assert!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id)
+                .usage
+                .is_none()
+        );
+        let (app, pane_id) = usage_app_with_agent(None);
+        assert!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id)
+                .usage
+                .is_none()
+        );
+    }
+
+    fn header_row_with_controls(
+        app: &AppState,
+        width: u16,
+        title: PaneChromeTitle,
+    ) -> (String, Vec<PaneChromeControl>) {
+        let area = Rect::new(0, 0, width, 3);
+        let backend = ratatui::backend::TestBackend::new(width, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut controls = Vec::new();
+        terminal
+            .draw(|frame| {
+                controls = render_code_ui_pane_chrome(
+                    app,
+                    frame,
+                    area,
+                    title,
+                    PaneId::from_raw(1),
+                    true,
+                    false,
+                    PaneTitleMode::Normal,
+                    true,
+                    ExposedSides::all(),
+                    None,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = (0..width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        (row, controls)
+    }
+
+    fn header_row(app: &AppState, width: u16, title: PaneChromeTitle) -> String {
+        header_row_with_controls(app, width, title).0
+    }
+
+    #[test]
+    fn usage_preserves_black_box_pop_controls_and_hit_areas() {
+        let (mut app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Claude));
+        app.host_pops_out_panes = true;
+        for width in [24, 38, 52, 80, 120] {
+            let title = pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id);
+            let (row, with) = header_row_with_controls(&app, width, title);
+            let mut title = pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id);
+            title.usage = None;
+            let (_, without) = header_row_with_controls(&app, width, title);
+            assert_eq!(with.len(), without.len());
+            for (a, b) in with.iter().zip(without.iter()) {
+                assert!(a.action == b.action);
+                assert_eq!(a.rect, b.rect);
+                assert_eq!(a.pane_id, b.pane_id);
+            }
+            let pops = with
+                .iter()
+                .any(|c| matches!(c.action, PaneChromeAction::PopOut));
+            assert_eq!(row.contains("POP"), pops, "width {width}: {row}");
+            if width >= 80 {
+                assert!(
+                    row.find("70%").expect("allowance") < row.find("POP").expect("pop control")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn usage_draws_after_the_name_and_drops_pieces_as_the_pane_narrows() {
+        let (app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Claude));
+        let make = || pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id);
+
+        let wide = header_row(&app, 80, make());
+        let name = wide.find("Olivia").expect("name");
+        let meters = wide
+            .find("5h ■■■■■■■■■■ 70% 3/h")
+            .expect("labelled five hour meter");
+        assert!(meters > name);
+        assert!(wide.contains("wk ■■■■■■■■■■ 80% 4/d"), "{wide}");
+
+        // Squares go first. Both two-letter labels stay.
+        let mid = header_row(&app, 52, make());
+        assert!(mid.contains("Olivia"), "{mid}");
+        assert!(mid.contains("5h 70% 3/h"), "{mid}");
+        assert!(mid.contains("wk 80% 4/d"), "{mid}");
+        assert!(!mid.contains('■'), "{mid}");
+
+        // Narrower: the weekly meter goes, and the five hour label stays.
+        let narrow = header_row(&app, 38, make());
+        assert!(narrow.contains("Olivia"), "{narrow}");
+        assert!(narrow.contains("5h 70% 3/h"), "{narrow}");
+        assert!(!narrow.contains("80%"), "{narrow}");
+        assert!(!narrow.contains('■'), "{narrow}");
+
+        // With no room left the meters give way and the header is exactly
+        // what it was without them: the name is never cut for the meters.
+        let mut bare = make();
+        bare.usage = None;
+        let tiny = header_row(&app, 24, make());
+        assert_eq!(tiny, header_row(&app, 24, bare));
+        assert!(!tiny.contains('%'), "{tiny}");
+    }
+
+    #[test]
     fn an_agent_pane_says_hide_instead_of_close() {
-        let (full, _) = pane_controls_text(40, false, true);
+        let (full, _) = pane_controls_text(40, PaneTitleMode::Normal, true, false);
         assert!(full.contains("HIDE"), "{full:?}");
         assert!(!full.contains('✕'), "{full:?}");
 
-        let (compact, _) = pane_controls_text(12, false, true);
+        let (compact, _) = pane_controls_text(12, PaneTitleMode::Normal, true, false);
         assert!(compact.contains("HIDE"), "{compact:?}");
         assert!(!compact.contains('✕'), "{compact:?}");
 
-        let (shell, _) = pane_controls_text(40, false, false);
+        let (shell, _) = pane_controls_text(40, PaneTitleMode::Normal, false, false);
         assert!(shell.contains('✕'), "{shell:?}");
         assert!(!shell.contains("HIDE"), "{shell:?}");
     }
 
     #[test]
+    fn pop_leads_the_controls_only_when_the_host_can_pop_out() {
+        let (with_pop, _) = pane_controls_text(40, PaneTitleMode::Normal, true, true);
+        assert_eq!(with_pop, " ⧉ POP ⛶ FOCUS HIDE ");
+
+        let (zoomed, _) = pane_controls_text(40, PaneTitleMode::Zoomed, false, true);
+        assert!(zoomed.starts_with(PANE_POP_CONTROL), "{zoomed:?}");
+
+        let (without, _) = pane_controls_text(40, PaneTitleMode::Normal, true, false);
+        assert!(!without.contains("POP"), "{without:?}");
+
+        let (peeking, _) = pane_controls_text(40, PaneTitleMode::Peeking, true, true);
+        assert!(!peeking.contains("POP"), "{peeking:?}");
+
+        let (narrow, _) = pane_controls_text(24, PaneTitleMode::Normal, true, true);
+        assert!(!narrow.contains("POP"), "{narrow:?}");
+    }
+
+    #[test]
+    fn pop_has_its_own_click_target_left_of_focus() {
+        let area = Rect::new(0, 0, 40, 5);
+        let (controls_text, controls_width) =
+            pane_controls_text(area.width, PaneTitleMode::Normal, true, true);
+        let controls =
+            pane_chrome_controls(area, PaneId::from_raw(1), &controls_text, controls_width);
+        let rect_for = |action| {
+            controls
+                .iter()
+                .find(|control| control.action == action)
+                .map(|control| control.rect)
+                .expect("control is present")
+        };
+        let pop = rect_for(PaneChromeAction::PopOut);
+        let focus = rect_for(PaneChromeAction::Focus);
+        let close = rect_for(PaneChromeAction::Close);
+
+        assert_eq!(pop.x, pane_chrome_controls_x(area, controls_width));
+        assert_eq!(pop.width, PANE_POP_CONTROL.width() as u16);
+        assert_eq!(focus.x, pop.x + pop.width);
+        assert_eq!(focus.x + focus.width, close.x);
+    }
+
+    #[test]
+    fn a_peeked_pane_says_exit_instead_of_back_and_hide() {
+        let (full, _) = pane_controls_text(40, PaneTitleMode::Peeking, true, false);
+        assert!(full.contains("EXIT"), "{full:?}");
+        assert!(!full.contains("BACK"), "{full:?}");
+        assert!(!full.contains("HIDE"), "{full:?}");
+        assert!(!full.contains('✕'), "{full:?}");
+
+        let (compact, _) = pane_controls_text(12, PaneTitleMode::Peeking, true, false);
+        assert!(compact.contains("EXIT"), "{compact:?}");
+        assert!(!compact.contains("HIDE"), "{compact:?}");
+
+        let (zoomed, _) = pane_controls_text(40, PaneTitleMode::Zoomed, true, false);
+        assert!(zoomed.contains("BACK"), "{zoomed:?}");
+        assert!(zoomed.contains("HIDE"), "{zoomed:?}");
+        assert!(!zoomed.contains("EXIT"), "{zoomed:?}");
+    }
+
+    #[test]
+    fn a_peeked_pane_border_uses_accent_not_focus() {
+        fn left_edge_color(app: &AppState, mode: PaneTitleMode) -> Option<Color> {
+            let area = Rect::new(0, 0, 24, 5);
+            let backend = ratatui::backend::TestBackend::new(24, 5);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_code_ui_pane_chrome(
+                        app,
+                        frame,
+                        area,
+                        PaneChromeTitle::name_only("panel"),
+                        PaneId::from_raw(1),
+                        true,
+                        false,
+                        mode,
+                        true,
+                        ExposedSides::all(),
+                        None,
+                    );
+                })
+                .unwrap();
+            terminal.backend().buffer()[(0, 2)].fg.into()
+        }
+
+        let mut app = AppState::test_new();
+        app.palette = crate::app::state::Palette::synthwave();
+        assert_ne!(
+            app.palette.accent,
+            app.palette.focused_pane_border(),
+            "synthwave keeps accent and focus apart"
+        );
+
+        assert_eq!(
+            left_edge_color(&app, PaneTitleMode::Peeking),
+            Some(app.palette.accent)
+        );
+        assert_eq!(
+            left_edge_color(&app, PaneTitleMode::Normal),
+            Some(app.palette.focused_pane_border())
+        );
+    }
+
+    #[test]
+    fn pane_close_control_rect_covers_exit_on_a_peeked_pane() {
+        let area = Rect::new(10, 2, 40, 5);
+        let (controls_text, controls_width) =
+            pane_controls_text(area.width, PaneTitleMode::Peeking, true, false);
+        let controls_x = pane_chrome_controls_x(area, controls_width);
+        let close = pane_close_control_rect(area, controls_x, &controls_text);
+        let suffix = pane_close_suffix(&controls_text);
+        let controls =
+            pane_chrome_controls(area, PaneId::from_raw(1), &controls_text, controls_width);
+
+        assert_eq!(suffix, " ◱ EXIT ");
+        assert_eq!(controls.len(), 1);
+        assert!(matches!(controls[0].action, PaneChromeAction::Close));
+        assert!(rect_contains(close, controls_x, area.y));
+        assert!(rect_contains(close, area.x + area.width - 2, area.y));
+    }
+
+    #[test]
     fn pane_close_control_rect_covers_hide_word_on_an_agent_pane() {
         let area = Rect::new(10, 2, 40, 5);
-        let (controls_text, controls_width) = pane_controls_text(area.width, false, true);
+        let (controls_text, controls_width) =
+            pane_controls_text(area.width, PaneTitleMode::Normal, true, false);
         let controls_x = pane_chrome_controls_x(area, controls_width);
-        let close = pane_close_control_rect(area, controls_x, controls_text);
-        let suffix = pane_close_suffix(controls_text);
+        let close = pane_close_control_rect(area, controls_x, &controls_text);
+        let suffix = pane_close_suffix(&controls_text);
         let suffix_start = controls_x + controls_text.width() as u16 - suffix.width() as u16;
 
         assert_eq!(suffix, " HIDE ");
@@ -1558,9 +2500,10 @@ mod tests {
     #[test]
     fn pane_close_control_rect_covers_close_suffix_and_padding() {
         let area = Rect::new(10, 2, 24, 5);
-        let (controls_text, controls_width) = pane_controls_text(area.width, false, false);
+        let (controls_text, controls_width) =
+            pane_controls_text(area.width, PaneTitleMode::Normal, false, false);
         let controls_x = pane_chrome_controls_x(area, controls_width);
-        let close = pane_close_control_rect(area, controls_x, controls_text);
+        let close = pane_close_control_rect(area, controls_x, &controls_text);
         let suffix_start =
             controls_x + controls_text.width() as u16 - PANE_CLOSE_CONTROL_SUFFIX.width() as u16;
         let cross_col = suffix_start + 1;
@@ -1576,11 +2519,11 @@ mod tests {
     #[test]
     fn pane_title_hit_area_excludes_rule_glyphs() {
         let area = Rect::new(0, 0, 80, 10);
-        let title = PaneChromeTitle {
-            folder_name: Some("Agent Work".to_string()),
-        };
-        let layout = pane_title_chrome_layout(area.width, &title, false, false);
-        let hit = pane_title_hit_area(area, &title, false, false).expect("title hit area");
+        let title = PaneChromeTitle::name_only("Agent Work");
+        let layout =
+            pane_title_chrome_layout(area.width, &title, PaneTitleMode::Normal, false, false);
+        let hit = pane_title_hit_area(area, &title, PaneTitleMode::Normal, false, false)
+            .expect("title hit area");
 
         assert!(layout.rule_width > 0, "expected decorative rule glyphs");
         assert_eq!(hit.width, layout.details_width);
@@ -1605,13 +2548,11 @@ mod tests {
                     &app,
                     frame,
                     area,
-                    PaneChromeTitle {
-                        folder_name: Some("panel".to_string()),
-                    },
+                    PaneChromeTitle::name_only("panel"),
                     PaneId::from_raw(1),
                     true,
                     false,
-                    false,
+                    PaneTitleMode::Normal,
                     true,
                     ExposedSides::all(),
                     None,
@@ -1627,12 +2568,57 @@ mod tests {
         let hide_col = (0..area.width)
             .find(|x| buffer[(*x, 0)].symbol() == "H")
             .expect("HIDE should render in pane chrome");
-        let (controls_text, controls_width) = pane_controls_text(area.width, false, true);
+        let (controls_text, controls_width) =
+            pane_controls_text(area.width, PaneTitleMode::Normal, true, false);
         let controls_x = pane_chrome_controls_x(area, controls_width);
-        let close = pane_close_control_rect(area, controls_x, controls_text);
+        let close = pane_close_control_rect(area, controls_x, &controls_text);
         assert!(
             rect_contains(close, hide_col, area.y),
             "hide rect {close:?} should cover rendered HIDE at column {hide_col}"
+        );
+    }
+
+    #[test]
+    fn rendered_peek_control_covers_exit_word() {
+        let app = AppState::test_new();
+        let area = Rect::new(0, 0, 40, 5);
+        let backend = ratatui::backend::TestBackend::new(40, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_code_ui_pane_chrome(
+                    &app,
+                    frame,
+                    area,
+                    PaneChromeTitle::name_only("panel"),
+                    PaneId::from_raw(1),
+                    true,
+                    false,
+                    PaneTitleMode::Peeking,
+                    true,
+                    ExposedSides::all(),
+                    None,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let top_row: String = (0..area.width).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(top_row.contains("EXIT"), "{top_row:?}");
+        assert!(!top_row.contains("BACK"), "{top_row:?}");
+        assert!(!top_row.contains("HIDE"), "{top_row:?}");
+
+        let exit_col = (0..area.width)
+            .find(|x| buffer[(*x, 0)].symbol() == "E")
+            .expect("EXIT should render in pane chrome");
+        let (controls_text, controls_width) =
+            pane_controls_text(area.width, PaneTitleMode::Peeking, true, false);
+        let controls_x = pane_chrome_controls_x(area, controls_width);
+        let close = pane_close_control_rect(area, controls_x, &controls_text);
+        assert!(
+            rect_contains(close, exit_col, area.y),
+            "exit rect {close:?} should cover rendered EXIT at column {exit_col}"
         );
     }
 
@@ -1649,13 +2635,11 @@ mod tests {
                     &app,
                     frame,
                     area,
-                    PaneChromeTitle {
-                        folder_name: Some("panel".to_string()),
-                    },
+                    PaneChromeTitle::name_only("panel"),
                     PaneId::from_raw(1),
                     true,
                     false,
-                    false,
+                    PaneTitleMode::Normal,
                     false,
                     ExposedSides::all(),
                     None,
@@ -1667,9 +2651,10 @@ mod tests {
         let cross_col = (0..area.width)
             .find(|x| buffer[(*x, 0)].symbol() == "✕")
             .expect("cross glyph should render in pane chrome");
-        let (controls_text, controls_width) = pane_controls_text(area.width, false, false);
+        let (controls_text, controls_width) =
+            pane_controls_text(area.width, PaneTitleMode::Normal, false, false);
         let controls_x = pane_chrome_controls_x(area, controls_width);
-        let close = pane_close_control_rect(area, controls_x, controls_text);
+        let close = pane_close_control_rect(area, controls_x, &controls_text);
 
         assert!(
             rect_contains(close, cross_col, area.y),
@@ -1785,13 +2770,11 @@ mod tests {
                         app,
                         frame,
                         area,
-                        PaneChromeTitle {
-                            folder_name: Some("panel".to_string()),
-                        },
+                        PaneChromeTitle::name_only("panel"),
                         PaneId::from_raw(1),
                         true,
                         false,
-                        false,
+                        PaneTitleMode::Normal,
                         false,
                         ExposedSides::all(),
                         None,
@@ -1823,13 +2806,11 @@ mod tests {
                     &app,
                     frame,
                     Rect::new(0, 0, 20, 5),
-                    PaneChromeTitle {
-                        folder_name: Some("panel".to_string()),
-                    },
+                    PaneChromeTitle::name_only("panel"),
                     PaneId::from_raw(1),
                     true,
                     false,
-                    false,
+                    PaneTitleMode::Normal,
                     false,
                     ExposedSides::all(),
                     None,
@@ -1959,13 +2940,11 @@ mod tests {
                     &app,
                     frame,
                     right,
-                    PaneChromeTitle {
-                        folder_name: Some("panel".to_string()),
-                    },
+                    PaneChromeTitle::name_only("panel"),
                     PaneId::from_raw(2),
                     false,
                     false,
-                    false,
+                    PaneTitleMode::Normal,
                     false,
                     exposed,
                     None,
@@ -2014,13 +2993,11 @@ mod tests {
                     &app,
                     frame,
                     right,
-                    PaneChromeTitle {
-                        folder_name: Some("panel".to_string()),
-                    },
+                    PaneChromeTitle::name_only("panel"),
                     PaneId::from_raw(2),
                     true,
                     false,
-                    false,
+                    PaneTitleMode::Normal,
                     false,
                     exposed,
                     None,
@@ -2166,13 +3143,11 @@ mod tests {
                     &app,
                     frame,
                     area,
-                    PaneChromeTitle {
-                        folder_name: Some("Review notes".to_string()),
-                    },
+                    PaneChromeTitle::name_only("Review notes"),
                     PaneId::from_raw(1),
                     true,
                     false,
-                    false,
+                    PaneTitleMode::Normal,
                     false,
                     ExposedSides::all(),
                     None,
@@ -2201,13 +3176,11 @@ mod tests {
                     &app,
                     frame,
                     area,
-                    PaneChromeTitle {
-                        folder_name: Some("Review notes".to_string()),
-                    },
+                    PaneChromeTitle::name_only("Review notes"),
                     PaneId::from_raw(1),
                     false, // unfocused
                     false, // not highlighted
-                    false,
+                    PaneTitleMode::Normal,
                     false,
                     ExposedSides::all(),
                     None,

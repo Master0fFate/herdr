@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::layout::Direction;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,11 @@ pub struct SessionSnapshot {
     /// can differ between the session that wrote this and the one that reads it.
     #[serde(default)]
     pub composer_agent: Option<String>,
+    /// The folder the composer Directory was left showing. A path rather than a
+    /// row because the list is rebuilt from running work, and the chosen folder
+    /// has to outlive that list the way the agent name outlives the harness table.
+    #[serde(default)]
+    pub composer_folder: Option<PathBuf>,
     /// Manual order of the session-wide agent table. Terminal ids are stable
     /// across pane rearrangement and are restored from pane snapshots.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -45,7 +50,13 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub sidebar_collapsed: bool,
     #[serde(default)]
+    pub agent_table_collapsed: bool,
+    #[serde(default)]
     pub spaces_collapsed: bool,
+    /// `herdr view usage hide`: the allowance meters are off in the table, the
+    /// pane headers and the sidebar for this session.
+    #[serde(default)]
+    pub usage_hidden: bool,
 }
 
 impl Default for SessionSnapshot {
@@ -56,6 +67,7 @@ impl Default for SessionSnapshot {
             active: None,
             selected: 0,
             composer_agent: None,
+            composer_folder: None,
             agent_order: Vec::new(),
             detached_agents: Vec::new(),
             sidebar_width: None,
@@ -63,7 +75,9 @@ impl Default for SessionSnapshot {
             collapsed_space_keys: std::collections::HashSet::new(),
             collapsed_agent_space_ids: std::collections::HashSet::new(),
             sidebar_collapsed: false,
+            agent_table_collapsed: false,
             spaces_collapsed: false,
+            usage_hidden: false,
         }
     }
 }
@@ -158,6 +172,8 @@ pub struct WorkspaceSnapshot {
     pub id: Option<String>,
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
@@ -190,6 +206,10 @@ struct LegacyWorkspaceSnapshot {
 pub struct TabSnapshot {
     #[serde(default)]
     pub custom_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub layout_preview_hidden: bool,
     pub layout: LayoutSnapshot,
     pub panes: HashMap<u32, PaneSnapshot>,
     pub zoomed: bool,
@@ -214,13 +234,16 @@ pub struct PaneSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
     /// Whether the finish had been acknowledged. An agent that finished wears
     /// the done marker until its marker is clicked, and clicking it leaves the
-    /// check behind, so both halves of the marker have to survive a restart or
-    /// the restart quietly clears the answer to "which one finished".
+    /// check behind until it is clicked again or another run finishes, so both
+    /// halves of the marker have to survive a restart or the restart quietly
+    /// clears the answer to "which one finished".
     /// Snapshots written before the marker was saved carry neither field: an
     /// agent in one of those reads as acknowledged and not finished, which is
     /// the same as no marker at all.
@@ -269,6 +292,8 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
     fn from(snap: LegacyWorkspaceSnapshot) -> Self {
         let identity_cwd = legacy_identity_cwd(&snap);
         let tab = TabSnapshot {
+            goal: None,
+            layout_preview_hidden: false,
             custom_name: None,
             layout: snap.layout,
             panes: snap.panes,
@@ -280,6 +305,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
         Self {
             id: None,
             custom_name: snap.custom_name,
+            purpose: None,
             identity_cwd,
             worktree_space: None,
             tabs: vec![tab],
@@ -302,6 +328,8 @@ struct RawSessionSnapshot {
     #[serde(default)]
     composer_agent: Option<String>,
     #[serde(default)]
+    composer_folder: Option<PathBuf>,
+    #[serde(default)]
     agent_order: Vec<crate::terminal::TerminalId>,
     #[serde(default)]
     detached_agents: Vec<DetachedAgentSnapshot>,
@@ -316,7 +344,11 @@ struct RawSessionSnapshot {
     #[serde(default)]
     sidebar_collapsed: bool,
     #[serde(default)]
+    agent_table_collapsed: bool,
+    #[serde(default)]
     spaces_collapsed: bool,
+    #[serde(default)]
+    usage_hidden: bool,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -330,6 +362,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         active: raw.active,
         selected: raw.selected,
         composer_agent: raw.composer_agent,
+        composer_folder: raw.composer_folder,
         agent_order: raw.agent_order,
         detached_agents: raw.detached_agents,
         sidebar_width: raw.sidebar_width,
@@ -337,7 +370,9 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         collapsed_space_keys: raw.collapsed_space_keys,
         collapsed_agent_space_ids: raw.collapsed_agent_space_ids,
         sidebar_collapsed: raw.sidebar_collapsed,
+        agent_table_collapsed: raw.agent_table_collapsed,
         spaces_collapsed: raw.spaces_collapsed,
+        usage_hidden: raw.usage_hidden,
     })
 }
 
@@ -402,6 +437,7 @@ pub fn capture(
         active: state.active,
         selected: state.selected,
         composer_agent: Some(state.composer.agent.clone()),
+        composer_folder: state.composer.folder_path().map(Path::to_path_buf),
         agent_order: state
             .agent_order
             .iter()
@@ -413,7 +449,9 @@ pub fn capture(
         collapsed_space_keys: state.collapsed_space_keys.clone(),
         collapsed_agent_space_ids: state.collapsed_agent_space_ids.clone(),
         sidebar_collapsed: state.sidebar_collapsed,
+        agent_table_collapsed: state.agent_table_collapsed,
         spaces_collapsed: state.spaces_collapsed,
+        usage_hidden: state.usage_hidden,
         detached_agents: state
             .detached_agents
             .iter()
@@ -451,6 +489,7 @@ fn capture_workspace(
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
         custom_name: ws.custom_name.clone(),
+        purpose: ws.purpose.clone(),
         identity_cwd: ws
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
             .unwrap_or_else(|| ws.identity_cwd.clone()),
@@ -522,6 +561,12 @@ fn capture_pane(
         label: terminal.and_then(|terminal| terminal.manual_label.clone()),
         agent_name: terminal.and_then(|terminal| terminal.agent_name.clone()),
         title_name: terminal.and_then(|terminal| terminal.title_name.clone()),
+        summary: terminal.and_then(|terminal| {
+            terminal
+                .manual_summary
+                .clone()
+                .or_else(|| terminal.session_title.clone())
+        }),
         agent_session,
         launch_argv: terminal.and_then(|terminal| terminal.launch_argv.clone()),
         seen: pane.seen,
@@ -547,6 +592,8 @@ fn capture_tab(
     }
     TabSnapshot {
         custom_name: tab.custom_name.clone(),
+        goal: tab.goal.clone(),
+        layout_preview_hidden: tab.layout_preview_hidden,
         layout: capture_node(tab.layout.root()),
         panes,
         zoomed: tab.zoomed,
@@ -771,6 +818,7 @@ mod tests {
                 completed: false,
                 agent_timing: None,
                 title_name: None,
+                summary: None,
             },
         );
         panes.insert(
@@ -786,17 +834,21 @@ mod tests {
                 completed: false,
                 agent_timing: None,
                 title_name: None,
+                summary: None,
             },
         );
 
         let snap = SessionSnapshot {
             workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
                 agent_order: Vec::new(),
                 tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
                     custom_name: Some("api".to_string()),
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
@@ -933,6 +985,39 @@ mod tests {
         assert_eq!(workspace.active_tab, second_tab);
         assert_eq!(workspace.tabs[0].custom_name.as_deref(), Some("main"));
         assert_eq!(workspace.tabs[1].custom_name.as_deref(), Some("logs"));
+    }
+
+    #[test]
+    fn capture_contract_tracks_workspace_purpose() {
+        let mut state = state_with_workspaces(&["one", "two"]);
+        state.workspaces[0].set_purpose("ship the sidebar");
+
+        let snapshot = capture_from_state(&state);
+        assert_eq!(
+            snapshot.workspaces[0].purpose.as_deref(),
+            Some("ship the sidebar")
+        );
+        assert_eq!(snapshot.workspaces[1].purpose, None);
+
+        let json = serde_json::to_string(&snapshot.workspaces[1]).unwrap();
+        assert!(!json.contains("purpose"));
+        let json = serde_json::to_string(&snapshot.workspaces[0]).unwrap();
+        let back: WorkspaceSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.purpose.as_deref(), Some("ship the sidebar"));
+    }
+
+    #[test]
+    fn capture_contract_tracks_tab_goal() {
+        let mut state = state_with_workspaces(&["one"]);
+        state.workspaces[0].tabs[0].set_goal("reproduce the crash");
+
+        let snapshot = capture_from_state(&state);
+        let tab = &snapshot.workspaces[0].tabs[0];
+        assert_eq!(tab.goal.as_deref(), Some("reproduce the crash"));
+
+        let json = serde_json::to_string(tab).unwrap();
+        let back: TabSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.goal.as_deref(), Some("reproduce the crash"));
     }
 
     #[test]
@@ -1194,6 +1279,28 @@ mod tests {
     }
 
     #[test]
+    fn capture_contract_saves_the_frozen_session_title() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&root]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_session_title(Some("Improve Agent Summary to be useful".into()));
+
+        let snapshot = capture_from_state(&state);
+        assert_eq!(
+            snapshot.workspaces[0].tabs[0].panes[&root.raw()]
+                .summary
+                .as_deref(),
+            Some("Improve Agent Summary to be useful")
+        );
+    }
+
+    #[test]
     fn capture_contract_preserves_restored_agent_session() {
         let mut state = state_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
@@ -1224,6 +1331,47 @@ mod tests {
             crate::agent_resume::AgentSessionRefKind::Id
         );
         assert_eq!(agent_session.value, "opencode-session");
+    }
+
+    #[test]
+    fn capture_saves_the_composer_folder() {
+        let mut state = AppState::test_new();
+        let folder = std::env::temp_dir();
+        state.composer.add_folder(folder.clone());
+
+        let snapshot = capture_from_state(&state);
+
+        assert_eq!(snapshot.composer_folder.as_deref(), Some(folder.as_path()));
+    }
+
+    #[test]
+    fn agent_table_collapsed_round_trips_through_json() {
+        let snap = SessionSnapshot {
+            agent_table_collapsed: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+        assert!(restored.agent_table_collapsed);
+    }
+
+    #[test]
+    fn old_snapshots_without_composer_folder_still_parse() {
+        let json = r#"{"version":3,"workspaces":[],"active":null,"selected":0}"#;
+        let snap = parse_snapshot(json).unwrap();
+        assert_eq!(snap.composer_folder, None);
+    }
+
+    #[test]
+    fn composer_folder_round_trips_through_json() {
+        let folder = PathBuf::from("/home/aaron/lab/herdr");
+        let snap = SessionSnapshot {
+            composer_folder: Some(folder.clone()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+        assert_eq!(restored.composer_folder, Some(folder));
     }
 
     #[test]
@@ -1262,6 +1410,7 @@ mod tests {
                 completed: false,
                 agent_timing: None,
                 title_name: None,
+                summary: None,
             },
         );
         panes.insert(
@@ -1279,18 +1428,22 @@ mod tests {
                 completed: false,
                 agent_timing: None,
                 title_name: None,
+                summary: None,
             },
         );
 
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
                 agent_order: Vec::new(),
                 tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
                         direction: DirectionSnapshot::Horizontal,
@@ -1320,5 +1473,24 @@ mod tests {
             restored.workspaces[0].tabs[0].panes[&0].cwd,
             PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test")
         );
+    }
+    #[test]
+    fn usage_hidden_round_trips_and_defaults_to_shown() {
+        let snap = SessionSnapshot {
+            usage_hidden: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(parse_snapshot(&json).unwrap().usage_hidden);
+        let mut state = AppState::test_new();
+        state.usage_hidden = true;
+        assert!(capture_from_state(&state).usage_hidden);
+        // A session saved before the switch existed shows usage.
+        let old = serde_json::to_string(&SessionSnapshot::default())
+            .unwrap()
+            .replace("\"usage_hidden\":false,", "")
+            .replace(",\"usage_hidden\":false", "");
+        assert!(!old.contains("usage_hidden"));
+        assert!(!parse_snapshot(&old).unwrap().usage_hidden);
     }
 }

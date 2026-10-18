@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, ListState, Paragraph, Tabs},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
     Frame,
 };
 
@@ -11,18 +11,18 @@ use super::widgets::{
     render_action_button, render_modal_choice_list, render_panel_shell, ActionButtonSpec,
 };
 use crate::{
-    app::{
-        state::{ExperimentSetting, Palette},
-        AppState,
-    },
-    config::ToastDelivery,
+    app::{state::ExperimentSetting, AppState},
+    config::{PaneHeaderField, ToastDelivery, UsageSwitch},
 };
+
+pub(crate) const SETTINGS_POPUP_WIDTH: u16 = 76;
+pub(crate) const SETTINGS_POPUP_HEIGHT: u16 = 26;
 
 pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
     use crate::app::state::SettingsSection;
 
     let p = &app.palette;
-    let Some(popup) = centered_popup_rect(area, 76, 22) else {
+    let Some(popup) = centered_popup_rect(area, SETTINGS_POPUP_WIDTH, SETTINGS_POPUP_HEIGHT) else {
         return;
     };
 
@@ -116,15 +116,10 @@ pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: R
             );
         }
         SettingsSection::PaneLabels => {
-            render_settings_toggle(
-                frame,
-                content_area,
-                p,
-                "agent border labels",
-                "show detected agent names in split pane borders",
-                app.agent_border_labels_enabled(),
-                app.settings.list.selected,
-            );
+            render_settings_pane_header(app, frame, content_area);
+        }
+        SettingsSection::Commander => {
+            render_settings_commander(app, frame, content_area);
         }
         SettingsSection::Experiments => {
             render_settings_experiments(app, frame, content_area);
@@ -419,26 +414,171 @@ fn render_settings_theme(app: &AppState, frame: &mut Frame, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_settings_toggle(
-    frame: &mut Frame,
-    area: Rect,
-    p: &Palette,
-    title: &str,
-    description: &str,
-    current_value: bool,
-    selected_idx: usize,
-) {
-    render_modal_choice_list(
+fn render_settings_pane_header(app: &AppState, frame: &mut Frame, area: Rect) {
+    let p = &app.palette;
+    let [desc_area, _, list_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas::<3>(area);
+
+    super::widgets::render_modal_description(
         frame,
-        area,
-        title,
-        description,
-        &[("on", true), ("off", false)],
-        current_value,
-        selected_idx,
-        p,
-        1,
+        desc_area,
+        "what each pane writes on its top edge, and where usage shows",
+        Style::default().fg(p.overlay1),
     );
+
+    // One layout, shared with the mouse: only the rows that fit are drawn, and
+    // the list scrolls so the selected row is always one of them.
+    let (visible, scroll) = pane_labels_window(area.height, app.settings.list.selected);
+    let field_count = PaneHeaderField::ALL.len();
+    for slot in 0..visible {
+        let idx = scroll + slot;
+        let (label, enabled) = if idx < field_count {
+            let field = PaneHeaderField::ALL[idx];
+            (field.label(), field.enabled(app.pane_header()))
+        } else {
+            // The other usage displays; the pane header's own switch is the
+            // `usage` field above.
+            let switch = UsageSwitch::ALL[idx - field_count];
+            (switch.label(), switch.enabled(&app.usage_config))
+        };
+        let marker = if enabled { "[✓]" } else { "[ ]" };
+        let style = if app.settings.list.selected == idx {
+            Style::default()
+                .bg(p.surface0)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.subtext0)
+        };
+        let row = Rect::new(list_area.x, list_area.y + slot as u16, list_area.width, 1);
+        frame.render_widget(
+            Paragraph::new(format!(" {label} {marker}")).style(style),
+            row,
+        );
+    }
+}
+
+/// Rows above the pane labels list inside the section's content: the
+/// description (2) and a gap (1).
+pub(crate) const PANE_LABELS_LIST_OFFSET: u16 = 3;
+
+/// How many pane label rows fit under the description in a content area
+/// `content_height` rows tall, and the first one drawn when `selected` is the
+/// highlighted row. Drawing and clicking both read this.
+pub(crate) fn pane_labels_window(content_height: u16, selected: usize) -> (usize, usize) {
+    let total = PaneHeaderField::ALL.len() + UsageSwitch::ALL.len();
+    let visible = usize::from(content_height.saturating_sub(PANE_LABELS_LIST_OFFSET)).min(total);
+    let scroll = if visible == 0 {
+        0
+    } else {
+        (selected + 1).saturating_sub(visible).min(total - visible)
+    };
+    (visible, scroll)
+}
+
+/// The hotkey row and the Jev key row inside the Commander section's content
+/// area. `app::input::settings` hit-tests clicks against them.
+pub(crate) const COMMANDER_KEY_ROW_OFFSET: u16 = 3;
+pub(crate) const COMMANDER_JEV_ROW_OFFSET: u16 = 4;
+
+/// A key shown without giving it away: its length in dots, then its last four
+/// characters.
+fn masked(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let shown = chars.len().min(4).min(chars.len() / 3);
+    let hidden = (chars.len() - shown).min(16);
+    let tail: String = chars[chars.len() - shown..].iter().collect();
+    format!("{}{tail}", "•".repeat(hidden))
+}
+
+fn render_settings_commander(app: &AppState, frame: &mut Frame, area: Rect) {
+    let p = &app.palette;
+    for (offset, line) in [
+        "the key that opens the Commander from anywhere, and the TypeSafe key",
+        "that lets Jev read what is typed into it instead of fixed phrases",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        super::widgets::render_modal_description(
+            frame,
+            Rect::new(area.x, area.y + offset as u16, area.width, 1),
+            line,
+            Style::default().fg(p.overlay1),
+        );
+    }
+    let selected = app.settings.list.selected;
+    let row_style = |idx: usize| {
+        if selected == idx {
+            Style::default()
+                .bg(p.surface0)
+                .fg(p.text)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.subtext0)
+        }
+    };
+
+    let row = area.y + COMMANDER_KEY_ROW_OFFSET;
+    if row >= area.bottom() {
+        return;
+    }
+    let value = if let (true, Some(refused)) = (
+        app.settings.capturing_commander_key,
+        &app.settings.refused_commander_key,
+    ) {
+        format!("“{refused}” would take over typing; try f2 or ctrl+space (esc to cancel)")
+    } else if app.settings.capturing_commander_key {
+        "press a key… (esc to cancel)".to_string()
+    } else {
+        app.keybinds
+            .commander
+            .label()
+            .unwrap_or_else(|| "unset".to_string())
+    };
+    let style = row_style(0);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" hotkey   ", style),
+            Span::styled(value, style.fg(p.accent)),
+        ]))
+        .style(style),
+        Rect::new(area.x, row, area.width, 1),
+    );
+
+    let row = area.y + COMMANDER_JEV_ROW_OFFSET;
+    if row >= area.bottom() {
+        return;
+    }
+    let style = row_style(1);
+    let value = match (&app.settings.editing_jev_key, &app.jev_api_key) {
+        (Some(draft), _) if draft.is_empty() => {
+            Span::styled("paste or type the key▏", style.fg(p.overlay0))
+        }
+        (Some(draft), _) => Span::styled(format!("{}▏", masked(draft)), style.fg(p.accent)),
+        (None, Some(key)) => Span::styled(masked(key), style.fg(p.accent)),
+        (None, None) => Span::styled("unset", style.fg(p.overlay0)),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(" jev key  ", style), value])).style(style),
+        Rect::new(area.x, row, area.width, 1),
+    );
+
+    let hint = match (selected, &app.settings.editing_jev_key) {
+        (_, Some(_)) => " enter to save · esc to cancel · saving it empty removes it",
+        (1, None) => " enter or click to set it · TYPESAFE_API_KEY is used when unset",
+        _ => " enter or click to change it",
+    };
+    if row + 2 < area.bottom() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(p.overlay0))),
+            Rect::new(area.x, row + 2, area.width, 1),
+        );
+    }
 }
 
 /// Row offsets inside the Sound section's content area. `app::input::settings`
@@ -515,6 +655,23 @@ fn render_settings_sound(app: &AppState, frame: &mut Frame, area: Rect) {
     }
 }
 
+/// Rows between the experiments description and the first checkbox.
+pub(crate) const EXPERIMENTS_CHECKBOX_ROWS_OFFSET: u16 = 3;
+
+pub(crate) fn experiments_prompt_rect(content: Rect) -> Option<Rect> {
+    let checkbox_count = ExperimentSetting::ALL.len() as u16;
+    let y = content
+        .y
+        .saturating_add(EXPERIMENTS_CHECKBOX_ROWS_OFFSET)
+        .saturating_add(checkbox_count)
+        .saturating_add(1);
+    let bottom = content.y.saturating_add(content.height);
+    if y + 2 >= bottom || content.width < 4 {
+        return None;
+    }
+    Some(Rect::new(content.x, y, content.width, bottom - y))
+}
+
 fn render_settings_experiments(app: &AppState, frame: &mut Frame, area: Rect) {
     let p = &app.palette;
     let [desc_area, _, list_area] = Layout::vertical([
@@ -533,7 +690,7 @@ fn render_settings_experiments(app: &AppState, frame: &mut Frame, area: Rect) {
 
     for (idx, setting) in ExperimentSetting::ALL.iter().copied().enumerate() {
         let marker = if setting.enabled(app) { "[✓]" } else { "[ ]" };
-        let style = if app.settings.list.selected == idx {
+        let style = if app.settings.list.selected == idx && !app.settings.editing_refresh_prompt {
             Style::default()
                 .bg(p.surface0)
                 .fg(p.text)
@@ -547,6 +704,31 @@ fn render_settings_experiments(app: &AppState, frame: &mut Frame, area: Rect) {
             row,
         );
     }
+
+    let Some(prompt_area) = experiments_prompt_rect(area) else {
+        return;
+    };
+    if prompt_area.height < 3 {
+        return;
+    }
+    let editing = app.settings.editing_refresh_prompt;
+    let border = if editing { p.accent } else { p.overlay0 };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(" prompt ");
+    let inner = block.inner(prompt_area);
+    frame.render_widget(block, prompt_area);
+    let mut text = app.refresh_summary_prompt();
+    if editing {
+        text.push('█');
+    }
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(if editing { p.text } else { p.subtext0 }))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 #[cfg(test)]
@@ -840,5 +1022,53 @@ mod tests {
         let rendered = rendered_settings(&app);
         assert!(rendered.contains("enter install"));
         assert!(rendered.contains("esc close"));
+    }
+
+    #[test]
+    fn experiments_renders_acknowledge_on_pane_focus_with_its_live_checkmark() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Settings;
+        app.settings.section = SettingsSection::Experiments;
+        assert!(rendered_settings(&app).contains("acknowledge completion on pane focus [ ]"));
+        app.acknowledge_on_pane_focus = true;
+        assert!(rendered_settings(&app).contains("acknowledge completion on pane focus [✓]"));
+    }
+
+    #[test]
+    fn experiments_renders_refresh_summary_with_grok_row() {
+        let mut app = AppState::test_new();
+        app.refresh_summary_with_grok = true;
+        app.settings.section = SettingsSection::Experiments;
+        app.settings.list.selected = 2;
+        app.mode = Mode::Settings;
+
+        let rendered = rendered_settings(&app);
+
+        assert!(rendered.contains("refresh summary with grok [✓]"));
+        assert!(rendered.contains("prompt"));
+        assert!(rendered.contains("In 5-8 words"));
+    }
+
+    #[test]
+    fn pane_header_lists_each_field_with_a_checkbox() {
+        let mut app = AppState::test_new();
+        // Header usage and the table column are off by default. This list still
+        // shows the header usage box checked.
+        app.pane_header.usage = true;
+        app.usage_config.table = true;
+        app.pane_header.working_directory = true;
+        app.settings.section = SettingsSection::PaneLabels;
+        app.mode = Mode::Settings;
+
+        let rendered = rendered_settings(&app);
+
+        assert!(rendered.contains("status [✓]"));
+        assert!(rendered.contains("agent name [✓]"));
+        assert!(rendered.contains("working directory [✓]"));
+        assert!(rendered.contains("parent directory [ ]"));
+        assert!(rendered.contains("git branch [ ]"));
+        assert!(rendered.contains("git status [ ]"));
+        assert!(rendered.contains("usage [✓]"));
+        assert!(rendered.contains("what each pane writes on its top edge"));
     }
 }

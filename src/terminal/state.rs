@@ -18,6 +18,11 @@ pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
 const CLAUDE_WORKING_HOLD: Duration = Duration::from_millis(1200);
 const STALE_HOOK_IDLE_GRACE: Duration = Duration::from_secs(2);
 
+fn summary_text_is_usable(text: &str) -> bool {
+    let trimmed = text.trim();
+    !trimmed.is_empty() && trimmed.chars().any(|c| c.is_alphanumeric())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookAuthority {
     pub source: String,
@@ -71,11 +76,26 @@ pub struct TerminalState {
     /// in the background from the session reported for this terminal.
     pub model_info: Option<crate::agent_model::AgentModelInfo>,
     /// A title read out of that same session log, for a harness that never
-    /// announces one. It stands in only when no reported title exists, so a
-    /// harness that names its own sessions always wins.
+    /// announces one. The first fill sticks; later probes do not replace it.
+    /// Refresh Summary takes the latest prompt on command. It stands in only
+    /// when no reported title and no live OSC title exist, so a harness that
+    /// names its own sessions always wins, and a pane that sets OSC 0/2
+    /// (Grok's tab title) fills Summary while it is emitting one.
     pub session_title: Option<String>,
-    /// Assigned-name slug taken from the first session title this terminal
-    /// received. Later title refreshes do not overwrite it.
+    /// A leftover typed summary from the old Update Summary dialog. It still
+    /// wins over the harness title and the probed session title. Refresh
+    /// Summary clears it so the current prompt can show.
+    pub manual_summary: Option<String>,
+    /// Live window title from OSC 0/2 in this pane (Grok's tab title, and
+    /// the same sequence from other TUIs). Not persisted; the next title
+    /// write replaces it. Wins over the probed session title, loses to a
+    /// harness-reported title and to a leftover manual summary.
+    pub osc_title: Option<String>,
+    /// Refresh Summary is waiting on a headless `grok -p`. The Summary column
+    /// shows "refreshing summary" until that job returns. Not persisted.
+    pub summary_refreshing: bool,
+    /// Unused leftover of title-derived assigned names. Restored sessions may
+    /// still carry it; display names come from the first-name word list.
     pub title_name: Option<String>,
     hook_report_sequences: HashMap<String, u64>,
     metadata_report_sequences: HashMap<String, u64>,
@@ -115,6 +135,9 @@ impl TerminalState {
             agent_name: None,
             model_info: None,
             session_title: None,
+            manual_summary: None,
+            osc_title: None,
+            summary_refreshing: false,
             title_name: None,
             hook_report_sequences: HashMap::new(),
             metadata_report_sequences: HashMap::new(),
@@ -774,22 +797,49 @@ impl TerminalState {
         self.agent_name = None;
     }
 
-    pub fn freeze_title_name(&mut self) {
-        if self.title_name.is_some() {
-            return;
-        }
-        let Some(title) = self
-            .effective_title()
-            .or_else(|| self.session_title.clone())
-        else {
-            return;
-        };
-        self.title_name = crate::pane_names::summary_name(&title);
+    pub fn set_session_title(&mut self, title: Option<String>) {
+        self.session_title = title.filter(|title| summary_text_is_usable(title));
     }
 
-    pub fn set_session_title(&mut self, title: Option<String>) {
-        self.session_title = title.filter(|title| !title.trim().is_empty());
-        self.freeze_title_name();
+    /// Replace the live OSC title. Returns whether Summary's effective text
+    /// may have changed.
+    pub fn set_osc_title(&mut self, title: Option<String>) -> bool {
+        let title = title.filter(|title| summary_text_is_usable(title));
+        if self.osc_title == title {
+            return false;
+        }
+        self.osc_title = title;
+        true
+    }
+
+    /// Fill the summary from a probed prompt. The first title sticks. Pass
+    /// `replace` to take a later prompt, which is what Refresh Summary does.
+    pub fn adopt_probed_title(&mut self, title: Option<String>, replace: bool) {
+        let Some(title) = title.filter(|title| summary_text_is_usable(title)) else {
+            return;
+        };
+        if replace {
+            self.session_title = Some(title);
+            self.clear_manual_summary();
+            return;
+        }
+        if self
+            .session_title
+            .as_ref()
+            .is_none_or(|current| !summary_text_is_usable(current))
+        {
+            self.session_title = Some(title);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_manual_summary(&mut self, summary: String) {
+        let summary = summary.trim().to_string();
+        self.manual_summary = (!summary.is_empty()).then_some(summary);
+    }
+
+    pub fn clear_manual_summary(&mut self) {
+        self.manual_summary = None;
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
@@ -804,6 +854,9 @@ impl TerminalState {
         self.persisted_agent_session = None;
         self.model_info = None;
         self.session_title = None;
+        self.manual_summary = None;
+        self.osc_title = None;
+        self.summary_refreshing = false;
         self.title_name = None;
         self.agent_metadata.clear();
         self.state = AgentState::Unknown;
@@ -997,12 +1050,16 @@ mod tests {
     }
 
     #[test]
-    fn freeze_title_name_takes_the_first_session_title() {
+    fn a_session_title_does_not_become_the_assigned_name() {
         let mut terminal = test_terminal();
         terminal.set_session_title(Some("Commit work and land herdr worktree".into()));
-        assert_eq!(terminal.title_name.as_deref(), Some("work-committer"));
+        assert_eq!(terminal.title_name, None);
+        assert_eq!(
+            terminal.session_title.as_deref(),
+            Some("Commit work and land herdr worktree")
+        );
         terminal.set_session_title(Some("Something else entirely now".into()));
-        assert_eq!(terminal.title_name.as_deref(), Some("work-committer"));
+        assert_eq!(terminal.title_name, None);
         assert_eq!(
             terminal.session_title.as_deref(),
             Some("Something else entirely now")
@@ -1010,12 +1067,47 @@ mod tests {
     }
 
     #[test]
-    fn freeze_title_name_ignores_unusable_titles() {
+    fn a_probed_title_fills_once_and_refresh_takes_a_later_prompt() {
         let mut terminal = test_terminal();
-        terminal.set_session_title(Some("!!!".into()));
-        assert_eq!(terminal.title_name, None);
-        terminal.set_session_title(Some("Fix the parser".into()));
-        assert_eq!(terminal.title_name.as_deref(), Some("parser-fixer"));
+        terminal.adopt_probed_title(Some("Improve Agent Summary to be useful".into()), false);
+        terminal.adopt_probed_title(Some("Land this on parent".into()), false);
+        assert_eq!(
+            terminal.session_title.as_deref(),
+            Some("Improve Agent Summary to be useful"),
+            "a later probe must not replace the first fill"
+        );
+
+        terminal.adopt_probed_title(Some("Land this on parent".into()), true);
+        assert_eq!(
+            terminal.session_title.as_deref(),
+            Some("Land this on parent")
+        );
+        terminal.set_manual_summary("typed leftover".into());
+        terminal.adopt_probed_title(Some("Refresh the current prompt".into()), true);
+        assert_eq!(terminal.manual_summary, None);
+        assert_eq!(
+            terminal.session_title.as_deref(),
+            Some("Refresh the current prompt")
+        );
+    }
+
+    #[test]
+    fn a_json_brace_title_is_not_kept_as_the_summary() {
+        let mut terminal = test_terminal();
+        terminal.set_session_title(Some("{".into()));
+        assert_eq!(terminal.session_title, None);
+
+        terminal.set_session_title(Some("{".into()));
+        terminal.adopt_probed_title(Some("{".into()), true);
+        assert_eq!(terminal.session_title, None);
+
+        terminal.set_session_title(Some("{".into()));
+        terminal.adopt_probed_title(Some("Land the herdr worktree".into()), false);
+        assert_eq!(
+            terminal.session_title.as_deref(),
+            Some("Land the herdr worktree"),
+            "a later probe may replace a JSON-noise summary"
+        );
     }
 
     #[test]

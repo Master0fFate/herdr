@@ -36,6 +36,7 @@ pub(crate) fn enter_composer_mode(
 
 pub(crate) fn leave_composer_mode(state: &mut AppState) {
     state.composer.close_dropdown();
+    state.composer.selecting = false;
     state.mode = if state.active.is_some() {
         Mode::Terminal
     } else {
@@ -57,10 +58,50 @@ pub(crate) fn handle_composer_key(
 
     let key = raw_key.as_key_event();
     let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+    let ctrl =
+        key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT);
+
+    if ctrl {
+        match key.code {
+            KeyCode::Char('a') => {
+                match state.composer.focus {
+                    Focus::Task => state.composer.task.select_all(),
+                    Focus::Folder if state.composer.open == Some(Focus::Folder) => {
+                        state.composer.edit_path(|path| path.select_all());
+                    }
+                    _ => {}
+                }
+                return ComposerKeyOutcome::Edited;
+            }
+            KeyCode::Char('c') => {
+                copy_focused_selection(state);
+                return ComposerKeyOutcome::Edited;
+            }
+            KeyCode::Char('x') => {
+                if copy_focused_selection(state) {
+                    match state.composer.focus {
+                        Focus::Task => {
+                            let _ = state.composer.task.delete_selection();
+                        }
+                        Focus::Folder if state.composer.open == Some(Focus::Folder) => {
+                            state.composer.edit_path(|path| {
+                                let _ = path.delete_selection();
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                return ComposerKeyOutcome::Edited;
+            }
+            _ => {}
+        }
+    }
 
     // An open dropdown owns the arrows and Enter, whichever control opened it.
     // Tab commits a pointed row the way Enter does. On the folder field they
-    // split: Tab takes the guessed directory, Enter takes only what was typed.
+    // split: Tab first writes the guessed name or the row pointed at into the
+    // field, and once there is nothing left to fill it takes the directory;
+    // Enter takes only what was typed, or the row pointed at.
     if let Some(open) = state.composer.open {
         match key.code {
             KeyCode::Esc => {
@@ -69,11 +110,7 @@ pub(crate) fn handle_composer_key(
             }
             KeyCode::BackTab => {
                 state.composer.close_dropdown();
-                state.composer.focus = match open {
-                    Focus::Folder => Focus::Task,
-                    Focus::Agent => Focus::Folder,
-                    Focus::Task => Focus::Agent,
-                };
+                state.composer.focus = open.previous();
                 return ComposerKeyOutcome::Edited;
             }
             KeyCode::Up => {
@@ -85,19 +122,35 @@ pub(crate) fn handle_composer_key(
                 return ComposerKeyOutcome::Edited;
             }
             KeyCode::Tab if open == Focus::Folder => {
+                if state.composer.fill_in_guess() {
+                    return ComposerKeyOutcome::Edited;
+                }
                 return match state.composer.take_folder() {
-                    Ok(()) => ComposerKeyOutcome::Edited,
+                    Ok(()) => {
+                        // Tab walks the controls in order, so it stops at the
+                        // worktree box that Enter steps over.
+                        state.composer.focus = Focus::Worktree;
+                        state.mark_session_dirty();
+                        ComposerKeyOutcome::Edited
+                    }
                     Err(err) => ComposerKeyOutcome::Trouble(err.message()),
                 };
             }
             KeyCode::Enter if open == Focus::Folder => {
                 return match state.composer.take_typed_folder() {
-                    Ok(()) => ComposerKeyOutcome::Edited,
+                    Ok(()) => {
+                        state.mark_session_dirty();
+                        ComposerKeyOutcome::Edited
+                    }
                     Err(err) => ComposerKeyOutcome::Trouble(err.message()),
                 };
             }
             KeyCode::Enter | KeyCode::Tab => {
+                let folder = open == Focus::Folder;
                 state.composer.take_pointed();
+                if folder {
+                    state.mark_session_dirty();
+                }
                 return ComposerKeyOutcome::Edited;
             }
             KeyCode::Char(' ') if open == Focus::Agent => {
@@ -128,28 +181,32 @@ pub(crate) fn handle_composer_key(
             ComposerKeyOutcome::Edited
         }
         KeyCode::Tab => {
-            state.composer.focus = match state.composer.focus {
-                Focus::Folder => Focus::Agent,
-                Focus::Agent => Focus::Task,
-                Focus::Task => Focus::Folder,
-            };
+            state.composer.focus = state.composer.focus.next();
             ComposerKeyOutcome::Edited
         }
         KeyCode::BackTab => {
-            state.composer.focus = match state.composer.focus {
-                Focus::Folder => Focus::Task,
-                Focus::Agent => Focus::Folder,
-                Focus::Task => Focus::Agent,
-            };
+            state.composer.focus = state.composer.focus.previous();
             ComposerKeyOutcome::Edited
         }
         _ => match state.composer.focus {
+            Focus::Worktree => worktree_key(state, key.code),
             Focus::Folder | Focus::Agent => {
                 closed_dropdown_key(state, terminal_runtimes, key.code, plain)
             }
             Focus::Task => task_key(state, key.code, key.modifiers, plain),
         },
     }
+}
+
+/// The worktree box is a checkbox: `Space` flips it and `Enter` settles it,
+/// handing the keyboard on to the agent like every other control.
+fn worktree_key(state: &mut AppState, code: KeyCode) -> ComposerKeyOutcome {
+    match code {
+        KeyCode::Char(' ') => state.composer.worktree = !state.composer.worktree,
+        KeyCode::Enter => state.composer.focus = Focus::Agent,
+        _ => {}
+    }
+    ComposerKeyOutcome::Edited
 }
 
 /// A dropdown that is closed changes its value outright, because the value is
@@ -163,8 +220,18 @@ fn closed_dropdown_key(
 ) -> ComposerKeyOutcome {
     let which = state.composer.focus;
     match code {
-        KeyCode::Up => state.composer.step(which, -1),
-        KeyCode::Down => state.composer.step(which, 1),
+        KeyCode::Up => {
+            state.composer.step(which, -1);
+            if which == Focus::Folder {
+                state.mark_session_dirty();
+            }
+        }
+        KeyCode::Down => {
+            state.composer.step(which, 1);
+            if which == Focus::Folder {
+                state.mark_session_dirty();
+            }
+        }
         KeyCode::Char(' ') if which == Focus::Agent => {
             state.composer.open_dropdown(Focus::Agent);
         }
@@ -229,14 +296,30 @@ fn task_key(
     }
 }
 
+fn copy_focused_selection(state: &mut AppState) -> bool {
+    let text = match state.composer.focus {
+        Focus::Task => state.composer.task.selected_text(),
+        Focus::Folder if state.composer.open == Some(Focus::Folder) => {
+            state.composer.path().selected_text()
+        }
+        _ => None,
+    };
+    let Some(text) = text else {
+        return false;
+    };
+    state.request_clipboard_write = Some(text.into_bytes());
+    true
+}
+
 /// The editing keys every field in the band shares. Returns whether the key was
 /// one of them.
-fn edit_field(
+pub(super) fn edit_field(
     field: &mut crate::composer::TextField,
     code: KeyCode,
     modifiers: KeyModifiers,
     plain: bool,
 ) -> bool {
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
     match code {
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => field.clear(),
         KeyCode::Backspace if modifiers.contains(KeyModifiers::SUPER) => field.clear(),
@@ -249,14 +332,24 @@ fn edit_field(
         KeyCode::Char('h' | 'w') if modifiers.contains(KeyModifiers::CONTROL) => delete_word(field),
         KeyCode::Backspace => field.backspace(),
         KeyCode::Delete => field.delete(),
+        KeyCode::Left if shift => field.select_left(),
+        KeyCode::Right if shift => field.select_right(),
         KeyCode::Left => field.left(),
         KeyCode::Right => field.right(),
+        KeyCode::Up if shift => {
+            field.select_up();
+        }
+        KeyCode::Down if shift => {
+            field.select_down();
+        }
         KeyCode::Up => {
             field.up();
         }
         KeyCode::Down => {
             field.down();
         }
+        KeyCode::Home if shift => field.select_home(),
+        KeyCode::End if shift => field.select_end(),
         KeyCode::Home => field.home(),
         KeyCode::End => field.end(),
         KeyCode::Char(c) if plain => field.insert(c),
@@ -284,6 +377,9 @@ fn word_class(ch: char) -> WordClass {
 /// separators, so deleting by class stops at the slash rather than eating the
 /// whole path.
 fn delete_word(field: &mut crate::composer::TextField) {
+    if field.delete_selection() {
+        return;
+    }
     let text = field.text();
     let mut chars: Vec<char> = text.chars().collect();
     while chars.last().is_some_and(|ch| ch.is_whitespace()) {
@@ -426,6 +522,49 @@ mod tests {
     }
 
     #[test]
+    fn shift_arrows_select_task_text_and_ctrl_c_copies_it() {
+        let mut state = composer_state();
+        type_in(&mut state, "fix the tests");
+        press_key(&mut state, shift(KeyCode::Left));
+        press_key(&mut state, shift(KeyCode::Left));
+        press_key(&mut state, shift(KeyCode::Left));
+        press_key(&mut state, shift(KeyCode::Left));
+        press_key(&mut state, shift(KeyCode::Left));
+        assert_eq!(
+            state.composer.task.selected_text().as_deref(),
+            Some("tests")
+        );
+
+        press_key(&mut state, ctrl(KeyCode::Char('c')));
+        assert_eq!(
+            state.request_clipboard_write.as_deref(),
+            Some(b"tests".as_slice())
+        );
+        assert_eq!(state.composer.task.text(), "fix the tests");
+    }
+
+    #[test]
+    fn ctrl_a_selects_the_whole_task() {
+        let mut state = composer_state();
+        type_in(&mut state, "fix the tests");
+        press_key(&mut state, ctrl(KeyCode::Char('a')));
+        assert_eq!(
+            state.composer.task.selected_text().as_deref(),
+            Some("fix the tests")
+        );
+    }
+
+    #[test]
+    fn typing_replaces_the_selected_task_text() {
+        let mut state = composer_state();
+        type_in(&mut state, "fix the tests");
+        press_key(&mut state, ctrl(KeyCode::Char('a')));
+        type_in(&mut state, "rename it");
+        assert_eq!(state.composer.task.text(), "rename it");
+        assert!(!state.composer.task.has_selection());
+    }
+
+    #[test]
     fn ctrl_w_deletes_the_last_word() {
         let mut state = composer_state();
         type_in(&mut state, "rename the route bar");
@@ -544,6 +683,11 @@ mod tests {
             Some(root.join("herdr-old").as_path())
         );
         assert_eq!(state.composer.focus, Focus::Agent);
+        assert!(
+            state.session_dirty,
+            "a chosen folder has to be written before a restart"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -567,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_on_a_half_typed_folder_takes_the_one_at_the_top_of_the_list() {
+    fn tab_on_a_half_typed_folder_completes_it_then_takes_it() {
         let root = folders_on_disk("tabhalf");
         let mut state = composer_state();
         state.composer.focus = Focus::Folder;
@@ -575,10 +719,69 @@ mod tests {
 
         assert_eq!(press(&mut state, KeyCode::Tab), ComposerKeyOutcome::Edited);
         assert_eq!(
+            state.composer.path().text(),
+            format!("{}/herdr", root.display()),
+            "the guess is written in"
+        );
+        assert!(state.composer.path().at_end());
+        assert_eq!(
+            state.composer.open,
+            Some(Focus::Folder),
+            "and not settled yet"
+        );
+
+        assert_eq!(press(&mut state, KeyCode::Tab), ComposerKeyOutcome::Edited);
+        assert_eq!(
             state.composer.folder_path(),
             Some(root.join("herdr").as_path())
         );
+        assert_eq!(state.composer.focus, Focus::Worktree);
+    }
+
+    #[test]
+    fn tab_on_a_pointed_folder_writes_it_in_then_takes_it() {
+        let root = folders_on_disk("tabpointed");
+        let mut state = composer_state();
+        state.composer.focus = Focus::Folder;
+        type_in(&mut state, &format!("{}/her", root.display()));
+        press(&mut state, KeyCode::Down);
+        press(&mut state, KeyCode::Down);
+        let pointed = state.composer.folder_rows()[1].clone();
+
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.composer.path().text(), pointed.label);
+        assert!(state.composer.path().at_end());
+        assert_eq!(
+            state.composer.open,
+            Some(Focus::Folder),
+            "and not settled yet"
+        );
+
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.composer.folder_path(), Some(pointed.path.as_path()));
+        assert_eq!(state.composer.focus, Focus::Worktree);
+    }
+
+    #[test]
+    fn tab_walks_through_the_worktree_box_where_space_flips_it() {
+        let mut state = composer_state();
+        state.composer.focus = Focus::Folder;
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.composer.focus, Focus::Worktree);
+
+        let before = state.composer.worktree;
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.composer.worktree, !before);
+        press(&mut state, KeyCode::Char(' '));
+        assert_eq!(state.composer.worktree, before);
+        assert_eq!(state.composer.open, None, "a checkbox opens nothing");
+
+        press(&mut state, KeyCode::Tab);
         assert_eq!(state.composer.focus, Focus::Agent);
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(state.composer.focus, Focus::Worktree);
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(state.composer.focus, Focus::Folder);
     }
 
     #[test]

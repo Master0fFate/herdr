@@ -14,9 +14,18 @@
 //! pane had nothing to show. The rollout does record what the user last asked
 //! for, so that prompt becomes the title instead: the summary column then says
 //! what a Codex agent is working on rather than staying blank. Grok does name
-//! a session, but only after the first prompt, and its hook reports the id at
-//! SessionStart, before that name exists. The generated title is written to
-//! the session's `summary.json`, so that file is what fills the column.
+//! a session, but only after the first prompt, and then freezes that name.
+//! The latest typed prompt lives in `chat_history.jsonl` as a `<user_query>`.
+//! The column does not take the whole message: it takes the part that asks
+//! for work, folded to a short headline. The first fill sticks on the row
+//! until a live OSC 0/2 window title arrives; Grok writes that title as it
+//! works, and Summary follows it. Refresh Summary reads the latest prompt on
+//! command, the same way the automatic update used to. With
+//! `[ui] refresh_summary_with_grok`, that command instead asks a headless
+//! `grok -p` session for a 5–8 word sentence naming the latest user request.
+//! `generated_title` in `summary.json` still stands in until a prompt has
+//! been parsed, and the same file still carries `current_model_id` and
+//! `reasoning_effort`.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -106,13 +115,12 @@ fn refresh_job(job: AgentModelRefreshJob) -> Option<AgentModelRefreshResult> {
         return None;
     }
 
-    let session_file = job
-        .cached
-        .as_ref()
-        .map(|cached| cached.session_file.clone())
-        .filter(|file| file.is_file())
-        .or_else(|| resolve_session_file(job.agent, &job.session_id))?;
-    let modified = fs::metadata(&session_file).ok()?.modified().ok()?;
+    let session_file = resolve_job_session_file(&job)?;
+    let modified = if job.agent == Agent::Grok {
+        grok_sources_mtime(&session_file)?
+    } else {
+        fs::metadata(&session_file).ok()?.modified().ok()?
+    };
     if job
         .cached
         .as_ref()
@@ -121,11 +129,14 @@ fn refresh_job(job: AgentModelRefreshJob) -> Option<AgentModelRefreshResult> {
         return None;
     }
 
+    if job.agent == Agent::Grok {
+        return refresh_grok_job(job, session_file, modified);
+    }
+
     let tail = read_tail(&session_file, TAIL_READ_BYTES).ok()?;
     let info = match job.agent {
         Agent::Claude => parse_claude_transcript_tail(&tail),
         Agent::Codex => parse_codex_rollout_tail(&tail),
-        Agent::Grok => parse_grok_summary_tail(&tail),
         _ => None,
     }
     // The tail window can land past the last model-bearing entry (e.g. a huge
@@ -141,7 +152,6 @@ fn refresh_job(job: AgentModelRefreshJob) -> Option<AgentModelRefreshResult> {
                 .map(|cached| cached.title_scanned_len),
             parse_codex_rollout_title,
         ),
-        Agent::Grok => (parse_grok_summary_title(&tail), 0),
         _ => (None, 0),
     };
     let title = title.or_else(|| job.cached.and_then(|cached| cached.title));
@@ -151,6 +161,65 @@ fn refresh_job(job: AgentModelRefreshJob) -> Option<AgentModelRefreshResult> {
         entry: AgentModelCacheEntry {
             session_id: job.session_id,
             session_file,
+            modified,
+            info,
+            title,
+            title_scanned_len,
+        },
+    })
+}
+
+fn resolve_job_session_file(job: &AgentModelRefreshJob) -> Option<PathBuf> {
+    if job.agent == Agent::Grok {
+        if let Some(cached) = job.cached.as_ref() {
+            if let Some(preferred) = grok_preferred_file(&cached.session_file) {
+                return Some(preferred);
+            }
+        }
+        return resolve_session_file(job.agent, &job.session_id);
+    }
+    job.cached
+        .as_ref()
+        .map(|cached| cached.session_file.clone())
+        .filter(|file| file.is_file())
+        .or_else(|| resolve_session_file(job.agent, &job.session_id))
+}
+
+fn refresh_grok_job(
+    job: AgentModelRefreshJob,
+    session_file: PathBuf,
+    modified: SystemTime,
+) -> Option<AgentModelRefreshResult> {
+    let (summary_path, history_path) = grok_session_paths(&session_file);
+    let summary_text = fs::read_to_string(&summary_path).ok();
+    let info = summary_text
+        .as_deref()
+        .and_then(parse_grok_summary_tail)
+        .or_else(|| job.cached.as_ref().and_then(|cached| cached.info.clone()));
+
+    let scanned_from = job
+        .cached
+        .as_ref()
+        .filter(|cached| cached.session_file == history_path)
+        .map(|cached| cached.title_scanned_len);
+    let (title, title_scanned_len) = if history_path.is_file() {
+        scan_session_title(&history_path, scanned_from, parse_grok_chat_title)
+    } else {
+        (None, 0)
+    };
+    let title = title
+        .or_else(|| job.cached.as_ref().and_then(|cached| cached.title.clone()))
+        .or_else(|| summary_text.as_deref().and_then(parse_grok_summary_title));
+
+    Some(AgentModelRefreshResult {
+        terminal_id: job.terminal_id,
+        entry: AgentModelCacheEntry {
+            session_id: job.session_id,
+            session_file: if history_path.is_file() {
+                history_path
+            } else {
+                summary_path
+            },
             modified,
             info,
             title,
@@ -198,15 +267,53 @@ fn codex_session_file(codex_home: &Path, session_id: &str) -> Option<PathBuf> {
     find_file_with_suffix(&codex_home.join("sessions"), &suffix, 4)
 }
 
-/// Grok sessions live at `<home>/sessions/<encoded-cwd>/<session-id>/summary.json`.
+/// Grok sessions live at `<home>/sessions/<encoded-cwd>/<session-id>/`.
+/// Prefer `chat_history.jsonl` (the growing prompt log) and fall back to
+/// `summary.json` for a session that has been named but has no history yet.
 fn grok_session_file(grok_home: &Path, session_id: &str) -> Option<PathBuf> {
     for entry in fs::read_dir(grok_home.join("sessions")).ok()?.flatten() {
-        let candidate = entry.path().join(session_id).join("summary.json");
-        if candidate.is_file() {
-            return Some(candidate);
+        let dir = entry.path().join(session_id);
+        if let Some(preferred) = grok_preferred_file(&dir.join("summary.json")) {
+            return Some(preferred);
         }
     }
     None
+}
+
+fn grok_session_paths(session_file: &Path) -> (PathBuf, PathBuf) {
+    let dir = grok_session_dir(session_file);
+    (dir.join("summary.json"), dir.join("chat_history.jsonl"))
+}
+
+fn grok_session_dir(session_file: &Path) -> &Path {
+    session_file.parent().unwrap_or(session_file)
+}
+
+fn grok_preferred_file(cached_file: &Path) -> Option<PathBuf> {
+    let dir = grok_session_dir(cached_file);
+    let history = dir.join("chat_history.jsonl");
+    if history.is_file() {
+        return Some(history);
+    }
+    let summary = dir.join("summary.json");
+    if summary.is_file() {
+        return Some(summary);
+    }
+    cached_file.is_file().then(|| cached_file.to_path_buf())
+}
+
+fn grok_sources_mtime(session_file: &Path) -> Option<SystemTime> {
+    let (summary, history) = grok_session_paths(session_file);
+    let mut latest: Option<SystemTime> = None;
+    for path in [&summary, &history] {
+        if let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) {
+            latest = Some(match latest {
+                Some(previous) => previous.max(modified),
+                None => modified,
+            });
+        }
+    }
+    latest.or_else(|| fs::metadata(session_file).ok()?.modified().ok())
 }
 
 fn find_file_with_suffix(dir: &Path, suffix: &str, depth: u8) -> Option<PathBuf> {
@@ -383,7 +490,7 @@ fn parse_codex_rollout_title(tail: &str) -> Option<String> {
         else {
             continue;
         };
-        if let Some(title) = session_title_from_prompt(text) {
+        if let Some(title) = action_title_from_prompt(text) {
             return Some(title);
         }
     }
@@ -393,8 +500,10 @@ fn parse_codex_rollout_title(tail: &str) -> Option<String> {
 /// The title Grok generated for the session, taken from `summary.json`.
 ///
 /// Grok writes that name after the first prompt and regenerates it a couple of
-/// times before freezing it. A missing or blank `generated_title` is a session
-/// that has not been named yet, so the column stays empty until one appears.
+/// times before freezing it. It is the fallback for a session whose chat
+/// history has no typed prompt yet. A missing or blank `generated_title` is a
+/// session that has not been named yet, so the column stays empty until a
+/// prompt or a generated title appears.
 fn parse_grok_summary_title(content: &str) -> Option<String> {
     let entry = serde_json::from_str::<serde_json::Value>(content).ok()?;
     session_title_from_prompt(
@@ -403,6 +512,545 @@ fn parse_grok_summary_title(content: &str) -> Option<String> {
             .and_then(|title| title.as_str())?,
     )
 }
+
+/// The last thing the user actually asked for, taken from the newest `user`
+/// record in `chat_history.jsonl`.
+///
+/// Grok writes more than typed prompts into that role: `<user_info>`,
+/// `<system-reminder>`, and other injected blocks, often marked
+/// `synthetic_reason`. Those are the harness talking to its own model, not a
+/// task. A record that carries `synthetic_reason` is skipped. A record whose
+/// text contains a `<user_query>` uses that inner text. Anything else is the
+/// same filter Codex uses: a message that opens a tag is not a title.
+fn parse_grok_chat_title(tail: &str) -> Option<String> {
+    for line in tail.lines().rev() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|entry_type| entry_type.as_str()) != Some("user") {
+            continue;
+        }
+        if entry.get("synthetic_reason").is_some() {
+            continue;
+        }
+        let Some(text) = grok_user_text(&entry) else {
+            continue;
+        };
+        if let Some(title) = grok_title_from_user_text(&text) {
+            return Some(title);
+        }
+    }
+    None
+}
+
+fn grok_user_text(entry: &serde_json::Value) -> Option<String> {
+    let content = entry.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+    let mut text = String::new();
+    for part in content.as_array()? {
+        if part.get("type").and_then(|kind| kind.as_str()) != Some("text") {
+            continue;
+        }
+        let Some(piece) = part.get("text").and_then(|text| text.as_str()) else {
+            continue;
+        };
+        if piece.trim().is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(piece);
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn grok_title_from_user_text(text: &str) -> Option<String> {
+    action_title_from_prompt(&raw_user_request_text(text)?)
+}
+
+/// Inner `<user_query>` text, or the message itself when it is not wrapped in
+/// a harness tag. Injected blocks that open a tag are skipped.
+fn raw_user_request_text(text: &str) -> Option<String> {
+    const OPEN: &str = "<user_query>";
+    const CLOSE: &str = "</user_query>";
+    let inner = if let Some(start) = text.find(OPEN) {
+        let rest = text.get(start + OPEN.len()..)?;
+        match rest.find(CLOSE) {
+            Some(end) => rest.get(..end)?,
+            None => rest,
+        }
+    } else {
+        text
+    };
+    let trimmed = inner.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('<')
+        || trimmed.starts_with("# AGENTS.md instructions")
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+const LATEST_USER_REQUEST_CHARS: usize = 1500;
+
+/// Newest typed user requests from the session log, newest first.
+pub(crate) fn latest_user_requests(agent: Agent, session_id: &str, limit: usize) -> Vec<String> {
+    if limit == 0 || !valid_probe_session_id(session_id) {
+        return Vec::new();
+    }
+    let Some(session_file) = resolve_session_file(agent, session_id) else {
+        return Vec::new();
+    };
+    match agent {
+        Agent::Grok => grok_latest_user_requests(&session_file, limit),
+        Agent::Codex => collect_latest_from_file(&session_file, limit, parse_codex_user_request),
+        Agent::Claude => collect_latest_from_file(&session_file, limit, parse_claude_user_request),
+        _ => Vec::new(),
+    }
+}
+
+fn grok_latest_user_requests(session_file: &Path, limit: usize) -> Vec<String> {
+    let (_, history_path) = grok_session_paths(session_file);
+    if !history_path.is_file() {
+        return Vec::new();
+    }
+    collect_latest_from_file(&history_path, limit, parse_grok_user_request)
+}
+
+fn collect_latest_from_file(
+    path: &Path,
+    limit: usize,
+    parse_line: fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let Ok(tail) = read_tail(path, TITLE_FIRST_SCAN_BYTES) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for line in tail.lines().rev() {
+        let Some(text) = parse_line(line) else {
+            continue;
+        };
+        found.push(truncate_user_request(&text));
+        if found.len() >= limit {
+            break;
+        }
+    }
+    found
+}
+
+fn truncate_user_request(text: &str) -> String {
+    let condensed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if condensed.chars().count() <= LATEST_USER_REQUEST_CHARS {
+        condensed
+    } else {
+        condensed.chars().take(LATEST_USER_REQUEST_CHARS).collect()
+    }
+}
+
+fn parse_grok_user_request(line: &str) -> Option<String> {
+    let entry = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if entry.get("type").and_then(|entry_type| entry_type.as_str()) != Some("user") {
+        return None;
+    }
+    if entry.get("synthetic_reason").is_some() {
+        return None;
+    }
+    raw_user_request_text(&grok_user_text(&entry)?)
+}
+
+fn parse_codex_user_request(line: &str) -> Option<String> {
+    let entry = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if entry.get("type").and_then(|entry_type| entry_type.as_str()) != Some("response_item") {
+        return None;
+    }
+    let payload = entry.get("payload")?;
+    if payload.get("type").and_then(|kind| kind.as_str()) != Some("message")
+        || payload.get("role").and_then(|role| role.as_str()) != Some("user")
+    {
+        return None;
+    }
+    let text = payload
+        .get("content")
+        .and_then(|content| content.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+        .find(|text| !text.trim().is_empty())?;
+    raw_user_request_text(text)
+}
+
+fn parse_claude_user_request(line: &str) -> Option<String> {
+    let entry = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if entry.get("type").and_then(|entry_type| entry_type.as_str()) != Some("user") {
+        return None;
+    }
+    if entry
+        .get("isSidechain")
+        .and_then(|sidechain| sidechain.as_bool())
+        == Some(true)
+    {
+        return None;
+    }
+    let content = entry.get("message")?.get("content")?;
+    let text = if let Some(text) = content.as_str() {
+        text.to_string()
+    } else {
+        let mut text = String::new();
+        for part in content.as_array()? {
+            if part.get("type").and_then(|kind| kind.as_str()) != Some("text") {
+                continue;
+            }
+            let Some(piece) = part.get("text").and_then(|text| text.as_str()) else {
+                continue;
+            };
+            if piece.trim().is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(piece);
+        }
+        if text.trim().is_empty() {
+            return None;
+        }
+        text
+    };
+    raw_user_request_text(&text)
+}
+
+/// Verbs that, as the first word, mean the sentence is asking for work.
+const TASK_VERBS: &[&str] = &[
+    "add",
+    "allow",
+    "build",
+    "change",
+    "close",
+    "commit",
+    "drop",
+    "edit",
+    "enable",
+    "fill",
+    "fix",
+    "follow",
+    "give",
+    "hide",
+    "highlight",
+    "improve",
+    "keep",
+    "land",
+    "make",
+    "move",
+    "open",
+    "paint",
+    "paste",
+    "point",
+    "put",
+    "read",
+    "remove",
+    "rename",
+    "replace",
+    "restore",
+    "revert",
+    "run",
+    "scroll",
+    "set",
+    "show",
+    "split",
+    "start",
+    "stop",
+    "summarize",
+    "switch",
+    "update",
+    "use",
+    "wire",
+    "write",
+];
+
+/// Hedging that leads a request without being the request.
+const HEDGE_PREFIXES: &[&str] = &[
+    "i kinda meant that ",
+    "i kind of meant that ",
+    "i kinda meant ",
+    "i meant that ",
+    "i think that ",
+    "i think ",
+    "i want you to ",
+    "i want it to ",
+    "i need you to ",
+    "i would like you to ",
+    "i would like ",
+    "i want ",
+    "i need ",
+    "can you please ",
+    "could you please ",
+    "can you ",
+    "could you ",
+    "would you ",
+    "please ",
+    "okay so ",
+    "ok so ",
+    "okay, ",
+    "ok, ",
+    "oof. ",
+    "oof, ",
+    "oof ",
+    "yeah, ",
+    "yeah ",
+    "well, ",
+    "so, ",
+];
+
+/// A short headline for the work a prompt is asking for, not the whole
+/// message. A quoted imperative is preferred when the user named the task.
+/// Otherwise the sentence that most looks like a request is kept, hedging is
+/// stripped, and the line is cut to what a table cell can hold.
+fn action_title_from_prompt(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('<') || trimmed.starts_with("# AGENTS.md instructions") {
+        return None;
+    }
+    let condensed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if condensed.is_empty() {
+        return None;
+    }
+
+    if let Some(quoted) = quoted_action_headline(&condensed) {
+        return finish_action_title(quoted);
+    }
+
+    let sentences = split_sentences(&condensed);
+    let chosen = sentences
+        .iter()
+        .copied()
+        .max_by_key(|sentence| action_score(sentence))
+        .filter(|sentence| action_score(sentence) > 0)
+        .or_else(|| {
+            sentences
+                .iter()
+                .copied()
+                .find(|sentence| !sentence.is_empty())
+        })
+        .unwrap_or(condensed.as_str());
+    let stripped = strip_hedges(chosen);
+    let source = if stripped.len() == chosen.trim().len() {
+        stripped
+    } else {
+        capitalize_first(&stripped)
+    };
+    finish_action_title(&source)
+}
+
+fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn quoted_action_headline(text: &str) -> Option<&str> {
+    for span in quoted_spans(text) {
+        let inner = span.trim();
+        let words = inner.split_whitespace().count();
+        if !(3..=ACTION_TITLE_MAX_WORDS).contains(&words) {
+            continue;
+        }
+        if first_word_is_task_verb(inner) {
+            return Some(inner);
+        }
+    }
+    None
+}
+
+fn quoted_spans(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(open_at) = rest.find(['"', '\u{201c}']) {
+        let open = rest[open_at..]
+            .chars()
+            .next()
+            .expect("find returned a char");
+        let close = if open == '\u{201c}' { '\u{201d}' } else { '"' };
+        let after_open = open_at + open.len_utf8();
+        let inner = &rest[after_open..];
+        let Some(close_at) = inner.find(close) else {
+            break;
+        };
+        spans.push(&inner[..close_at]);
+        rest = &inner[close_at + close.len_utf8()..];
+    }
+    spans
+}
+
+fn split_sentences(text: &str) -> Vec<&str> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_end = matches!(bytes[i], b'.' | b'?' | b'!');
+        let next_is_break = i + 1 == bytes.len()
+            || bytes
+                .get(i + 1)
+                .is_some_and(|next| next.is_ascii_whitespace());
+        if is_end && next_is_break {
+            let piece = text[start..i].trim();
+            if !piece.is_empty() {
+                sentences.push(piece);
+            }
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    let piece = text[start..].trim();
+    if !piece.is_empty() {
+        sentences.push(piece);
+    }
+    if sentences.is_empty() {
+        sentences.push(text.trim());
+    }
+    sentences
+}
+
+fn action_score(sentence: &str) -> i32 {
+    let trimmed = sentence.trim();
+    if trimmed.is_empty() {
+        return -100;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.trim_end_matches(['.', '?', '!']),
+        "oof"
+            | "yeah"
+            | "ok"
+            | "okay"
+            | "you know"
+            | "something like that"
+            | "thanks"
+            | "thank you"
+    ) {
+        return -50;
+    }
+
+    let mut score = 0;
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if first_word_is_task_verb(trimmed) {
+        score += 6;
+    }
+    if lower.starts_with("can you")
+        || lower.starts_with("could you")
+        || lower.starts_with("can the")
+        || lower.starts_with("could the")
+        || lower.starts_with("can it")
+    {
+        score += 5;
+    }
+    if lower.starts_with("i want")
+        || lower.starts_with("i need")
+        || lower.starts_with("i kinda")
+        || lower.starts_with("please")
+        || lower.starts_with("this one might be")
+    {
+        score += 5;
+    }
+    if lower.contains(" should ") || lower.starts_with("should ") {
+        score += 4;
+    }
+    if lower.contains(" make it ") || lower.contains("can it") {
+        score += 2;
+    }
+    if lower.starts_with("that doesn't")
+        || lower.starts_with("that does not")
+        || lower.starts_with("it currently")
+    {
+        score -= 3;
+    }
+    let n = words.len();
+    if (4..=16).contains(&n) {
+        score += 2;
+    }
+    if n < 3 {
+        score -= 2;
+    }
+    score
+}
+
+fn first_word_is_task_verb(text: &str) -> bool {
+    let Some(word) = text.split_whitespace().next() else {
+        return false;
+    };
+    let cleaned: String = word
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    TASK_VERBS.contains(&cleaned.as_str())
+}
+
+fn strip_hedges(text: &str) -> String {
+    let mut rest = text.trim().to_string();
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(prefix) = HEDGE_PREFIXES
+            .iter()
+            .find(|prefix| lower.starts_with(*prefix))
+        else {
+            break;
+        };
+        rest = rest.chars().skip(prefix.chars().count()).collect();
+        rest = rest
+            .trim_start_matches(|ch: char| ch == ',' || ch == '.' || ch.is_whitespace())
+            .to_string();
+    }
+    rest
+}
+
+fn finish_action_title(text: &str) -> Option<String> {
+    let trimmed = text.trim().trim_end_matches(['.', '?', '!', ',', ';']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+    if words.len() > ACTION_TITLE_MAX_WORDS {
+        words.truncate(ACTION_TITLE_MAX_WORDS);
+    }
+    let mut title = words.join(" ");
+    if title.chars().count() > ACTION_TITLE_MAX_CHARS {
+        let mut kept = String::new();
+        for word in title.split_whitespace() {
+            let next_len =
+                kept.chars().count() + word.chars().count() + usize::from(!kept.is_empty());
+            if next_len > ACTION_TITLE_MAX_CHARS {
+                break;
+            }
+            if !kept.is_empty() {
+                kept.push(' ');
+            }
+            kept.push_str(word);
+        }
+        if kept.is_empty() {
+            return None;
+        }
+        title = kept;
+    }
+    Some(title)
+}
+
+const ACTION_TITLE_MAX_CHARS: usize = 72;
+const ACTION_TITLE_MAX_WORDS: usize = 12;
 
 /// `current_model_id` plus `reasoning_effort` from the same summary file.
 fn parse_grok_summary_tail(content: &str) -> Option<AgentModelInfo> {
@@ -800,6 +1448,256 @@ mod tests {
         );
     }
 
+    fn grok_user_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"user","content":[{{"type":"text","text":{}}}]}}"#,
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
+    #[test]
+    fn grok_chat_title_is_the_latest_typed_prompt() {
+        let tail = [
+            grok_user_line("<user_info>\nOS Version: linux\n</user_info>"),
+            grok_user_line("<user_query>\nfix the pane border\n</user_query>"),
+            r#"{"type":"user","synthetic_reason":"system_reminder","content":[{"type":"text","text":"<system-reminder>\nskills\n</system-reminder>"}]}"#.to_string(),
+            grok_user_line("<user_query>\nreorder\n  the   agent list\n</user_query>"),
+            r#"{"type":"assistant","content":[{"type":"text","text":"on it"}]}"#.to_string(),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            parse_grok_chat_title(&tail).as_deref(),
+            Some("reorder the agent list"),
+            "the newest typed prompt wins, on one line, past injected context"
+        );
+    }
+
+    #[test]
+    fn grok_latest_user_requests_are_newest_first_and_skip_injected_blocks() {
+        let tail = [
+            grok_user_line("<user_info>\nOS Version: linux\n</user_info>"),
+            grok_user_line("<user_query>\nImprove Agent Summary to be useful\n</user_query>"),
+            r#"{"type":"user","synthetic_reason":"system_reminder","content":[{"type":"text","text":"<system-reminder>\nskills\n</system-reminder>"}]}"#.to_string(),
+            grok_user_line("<user_query>\nLand this on parent\n</user_query>"),
+        ]
+        .join("\n");
+        let requests = collect_latest_from_file_for_test(&tail, 3, parse_grok_user_request);
+        assert_eq!(
+            requests,
+            vec![
+                "Land this on parent".to_string(),
+                "Improve Agent Summary to be useful".to_string(),
+            ]
+        );
+    }
+
+    fn collect_latest_from_file_for_test(
+        tail: &str,
+        limit: usize,
+        parse_line: fn(&str) -> Option<String>,
+    ) -> Vec<String> {
+        let mut found = Vec::new();
+        for line in tail.lines().rev() {
+            let Some(text) = parse_line(line) else {
+                continue;
+            };
+            found.push(truncate_user_request(&text));
+            if found.len() >= limit {
+                break;
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn action_title_uses_a_quoted_imperative_headline() {
+        let prompt = concat!(
+            "Oof. That doesn't help tell me what the agent did. ",
+            "I kinda meant that I want it to summarize the part of the prompt that encites action. ",
+            r#"this one might be "Improve Agent Summary to be useful". You know? something like that."#
+        );
+        assert_eq!(
+            action_title_from_prompt(prompt).as_deref(),
+            Some("Improve Agent Summary to be useful")
+        );
+    }
+
+    #[test]
+    fn action_title_picks_the_ask_out_of_a_rambling_prompt() {
+        let prompt = concat!(
+            "Can the Summary update based on what the user has sent next. ",
+            "It currently is set when the first message comes back. ",
+            "but can it also be evaluated to contain a summary of what the user submitted as a prompt?"
+        );
+        assert_eq!(
+            action_title_from_prompt(prompt).as_deref(),
+            Some("Can the Summary update based on what the user has sent next")
+        );
+    }
+
+    #[test]
+    fn action_title_prefers_the_command_over_the_setup() {
+        assert_eq!(
+            action_title_from_prompt("Can you see the Test Section. Change it to green.")
+                .as_deref(),
+            Some("Change it to green")
+        );
+    }
+
+    #[test]
+    fn action_title_strips_hedging_from_a_request() {
+        assert_eq!(
+            action_title_from_prompt("I kinda meant that I want it to summarize the action.")
+                .as_deref(),
+            Some("Summarize the action")
+        );
+    }
+
+    #[test]
+    fn grok_chat_title_is_absent_until_the_user_asks_for_something() {
+        let tail = [
+            grok_user_line("<user_info>\nOS Version: linux\n</user_info>"),
+            r#"{"type":"user","synthetic_reason":"compaction_meta","content":[{"type":"text","text":"continued from a previous conversation"}]}"#.to_string(),
+            r#"{"type":"assistant","content":[{"type":"text","text":"ready"}]}"#.to_string(),
+        ]
+        .join("\n");
+
+        assert_eq!(parse_grok_chat_title(&tail), None);
+    }
+
+    #[test]
+    fn grok_refresh_prefers_the_latest_user_query_over_generated_title() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-agent-model-grok-prompt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let summary = root.join("summary.json");
+        let history = root.join("chat_history.jsonl");
+        fs::write(
+            &summary,
+            r#"{
+              "generated_title": "Update Summary from Subsequent User Prompts",
+              "current_model_id": "grok-4.6",
+              "reasoning_effort": "high"
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &history,
+            format!(
+                "{}\n{}\n",
+                grok_user_line("<user_query>\nCan the Summary update based on the first prompt?\n</user_query>"),
+                grok_user_line("<user_query>\nCan the Summary update based on what the user has sent next?\n</user_query>")
+            ),
+        )
+        .unwrap();
+        let modified = fs::metadata(&summary).unwrap().modified().unwrap();
+
+        let refreshed = refresh_job(AgentModelRefreshJob {
+            terminal_id: TerminalId::alloc(),
+            agent: Agent::Grok,
+            session_id: "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c".into(),
+            cached: Some(AgentModelCacheEntry {
+                session_id: "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c".into(),
+                session_file: summary,
+                modified: modified - std::time::Duration::from_secs(60),
+                info: None,
+                title: Some("Update Summary from Subsequent User Prompts".into()),
+                title_scanned_len: 0,
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(
+            refreshed.entry.title.as_deref(),
+            Some("Can the Summary update based on what the user has sent next")
+        );
+        assert_eq!(refreshed.entry.session_file, history);
+        assert_eq!(
+            refreshed.entry.info,
+            Some(AgentModelInfo {
+                model: "grok-4.6".into(),
+                effort: Some("high".into()),
+            })
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn grok_refresh_keeps_a_prompt_title_when_only_the_generated_name_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-agent-model-grok-keep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let summary = root.join("summary.json");
+        let history = root.join("chat_history.jsonl");
+        let first = format!(
+            "{}\n",
+            grok_user_line("<user_query>\nfix the pane border\n</user_query>")
+        );
+        fs::write(&history, &first).unwrap();
+        fs::write(
+            &summary,
+            r#"{"generated_title":"Fix The Pane Border","current_model_id":"grok-4.6"}"#,
+        )
+        .unwrap();
+
+        let stale = fs::metadata(&history).unwrap().modified().unwrap()
+            - std::time::Duration::from_secs(60);
+        let first_pass = refresh_job(AgentModelRefreshJob {
+            terminal_id: TerminalId::alloc(),
+            agent: Agent::Grok,
+            session_id: "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c".into(),
+            cached: Some(AgentModelCacheEntry {
+                session_id: "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c".into(),
+                session_file: summary.clone(),
+                modified: stale,
+                info: None,
+                title: None,
+                title_scanned_len: 0,
+            }),
+        })
+        .unwrap();
+        assert_eq!(
+            first_pass.entry.title.as_deref(),
+            Some("fix the pane border")
+        );
+
+        fs::write(
+            &summary,
+            r#"{"generated_title":"A Frozen Generated Title","current_model_id":"grok-4.6"}"#,
+        )
+        .unwrap();
+        let mut cached = first_pass.entry.clone();
+        cached.modified -= std::time::Duration::from_secs(60);
+        let second_pass = refresh_job(AgentModelRefreshJob {
+            terminal_id: TerminalId::alloc(),
+            agent: Agent::Grok,
+            session_id: "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c".into(),
+            cached: Some(cached),
+        })
+        .unwrap();
+        assert_eq!(
+            second_pass.entry.title.as_deref(),
+            Some("fix the pane border"),
+            "a later generated_title must not replace a prompt already on the row"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn grok_session_file_resolves_cwd_grouped_summaries() {
         let root = std::env::temp_dir().join(format!(
@@ -820,7 +1718,15 @@ mod tests {
 
         assert_eq!(
             grok_session_file(&root, "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c"),
-            Some(summary)
+            Some(summary.clone())
+        );
+
+        let history = session.join("chat_history.jsonl");
+        fs::write(&history, "{}\n").unwrap();
+        assert_eq!(
+            grok_session_file(&root, "01a016ad-b38c-7c12-9e2b-32bd13e0cb7c"),
+            Some(history),
+            "the prompt log is preferred once it exists"
         );
         assert_eq!(grok_session_file(&root, "missing"), None);
 

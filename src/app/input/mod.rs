@@ -25,8 +25,10 @@ enum WheelRouting {
 const PANE_DRAG_THRESHOLD: u16 = 1;
 
 mod agent_table;
+mod commander;
 mod composer;
 mod copy_mode;
+mod describe_dialog;
 mod modal;
 mod mouse;
 mod navigate;
@@ -40,8 +42,16 @@ pub(crate) use self::agent_table::{
     agent_table_delete_intercept, confirm_close_agent_accept, confirm_close_agent_cancel,
     handle_confirm_close_agent_key,
 };
+pub(crate) use self::commander::{
+    catalog as commander_catalog, close_commander, handle_commander_key,
+    launch_point as commander_launch_point, open_commander, perform as perform_commander,
+    refresh_reading as refresh_commander_reading, submit_commander, CommanderKeyOutcome,
+};
 pub(crate) use self::composer::{
     enter_composer_mode, handle_composer_key, leave_composer_mode, ComposerKeyOutcome,
+};
+pub(crate) use self::describe_dialog::{
+    handle_describe_dialog_key, open_space_purpose_editor, open_tab_goal_editor,
 };
 pub(crate) use self::{
     modal::{
@@ -76,12 +86,14 @@ impl App {
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
+            Mode::Commander => self.commander_key(key),
             Mode::Composer => {
                 match handle_composer_key(&mut self.state, &self.terminal_runtimes, key) {
                     ComposerKeyOutcome::Submit(pending) => self.submit_composer(*pending),
                     ComposerKeyOutcome::Trouble(reason) => self.show_composer_trouble(reason),
                     ComposerKeyOutcome::Edited => {}
                 }
+                self.flush_clipboard_write();
             }
             _ => {
                 let key_event = key.as_key_event();
@@ -89,10 +101,15 @@ impl App {
                     Mode::Onboarding => self.handle_onboarding_key(key_event),
                     Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
                     Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
-                    Mode::Prefix | Mode::Navigate | Mode::Copy | Mode::Composer => unreachable!(),
-                    Mode::RenameWorkspace | Mode::RenamePane => {
+                    Mode::Prefix
+                    | Mode::Navigate
+                    | Mode::Copy
+                    | Mode::Composer
+                    | Mode::Commander => unreachable!(),
+                    Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                         handle_rename_key(&mut self.state, key_event)
                     }
+                    Mode::DescribeDialog => handle_describe_dialog_key(&mut self.state, key_event),
                     Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
                     Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
                     Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
@@ -184,6 +201,8 @@ impl App {
                     self.state.composer.type_agent(ch);
                 }
             }
+            // A checkbox takes no text.
+            crate::composer::Focus::Worktree => {}
         }
     }
 
@@ -227,6 +246,14 @@ impl App {
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
+        if self.state.mode == Mode::Commander {
+            self.commander_paste(&text);
+            return;
+        }
+        if self.state.mode == Mode::Settings {
+            self.settings_paste(&text);
+            return;
+        }
         if self.state.mode == Mode::Composer {
             match self.state.composer.focus {
                 // A pasted task keeps its lines: the field holds as many as it
@@ -248,7 +275,7 @@ impl App {
                         .composer
                         .edit_path(|path| path.insert_str(&first));
                 }
-                crate::composer::Focus::Agent => {}
+                crate::composer::Focus::Worktree | crate::composer::Focus::Agent => {}
             }
             return;
         }
@@ -394,8 +421,34 @@ impl App {
         }
     }
 
+    fn flush_clipboard_write(&mut self) {
+        if let Some(content) = self.state.request_clipboard_write.take() {
+            if self
+                .event_tx
+                .try_send(crate::events::AppEvent::ClipboardWrite { content })
+                .is_err()
+            {
+                tracing::warn!("failed to queue clipboard write event");
+            }
+        }
+    }
+
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.dismiss_config_diagnostic_at(mouse) {
+            return;
+        }
+
+        // The Commander is a small box over the panes: a click away from it
+        // puts it away, and nothing under it takes the event while it is up.
+        if self.state.mode == Mode::Commander {
+            let area = self.state.commander.area;
+            let inside = mouse.column >= area.x
+                && mouse.column < area.right()
+                && mouse.row >= area.y
+                && mouse.row < area.bottom();
+            if matches!(mouse.kind, MouseEventKind::Down(_)) && !inside {
+                close_commander(&mut self.state);
+            }
             return;
         }
 
@@ -417,6 +470,10 @@ impl App {
             return;
         }
 
+        if self.handle_tab_double_click(mouse) {
+            return;
+        }
+
         if self.handle_modified_url_click(mouse) {
             return;
         }
@@ -433,8 +490,11 @@ impl App {
                     SettingsAction::SaveToastDelivery(delivery) => {
                         self.save_toast_delivery(delivery)
                     }
-                    SettingsAction::SaveAgentBorderLabels(enabled) => {
-                        self.save_agent_border_labels(enabled)
+                    SettingsAction::SavePaneHeaderField(field, enabled) => {
+                        self.save_pane_header_field(field, enabled)
+                    }
+                    SettingsAction::SaveUsageSwitch(switch, enabled) => {
+                        self.save_usage_switch(switch, enabled)
                     }
                     SettingsAction::SavePaneHistory(enabled) => {
                         self.save_pane_history_persistence(enabled)
@@ -442,26 +502,30 @@ impl App {
                     SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
                         self.save_switch_ascii_input_source_in_prefix(enabled)
                     }
+                    SettingsAction::SaveRefreshSummaryWithGrok(enabled) => {
+                        self.save_refresh_summary_with_grok(enabled)
+                    }
+                    SettingsAction::SaveHideAttachedAgents(enabled) => {
+                        self.save_hide_attached_agents(enabled)
+                    }
+                    SettingsAction::SaveAcknowledgeOnPaneFocus(enabled) => {
+                        self.save_acknowledge_on_pane_focus(enabled)
+                    }
+                    SettingsAction::SaveCommanderKey(combo) => self.save_commander_key(&combo),
+                    SettingsAction::SaveJevApiKey(key) => self.save_jev_api_key(&key),
                     SettingsAction::InstallRecommendedIntegrations => {
                         self.install_recommended_integrations()
                     }
                 }
             }
         }
+        self.flush_refresh_summary_prompt_save();
         if previous_settings_section != crate::app::state::SettingsSection::Integrations
             && self.state.settings.section == crate::app::state::SettingsSection::Integrations
         {
             self.refresh_integration_recommendations();
         }
-        if let Some(content) = self.state.request_clipboard_write.take() {
-            if self
-                .event_tx
-                .try_send(crate::events::AppEvent::ClipboardWrite { content })
-                .is_err()
-            {
-                tracing::warn!("failed to queue clipboard write event");
-            }
-        }
+        self.flush_clipboard_write();
 
         // Sync autoscroll deadline with state (mouse handler may have
         // set or cleared selection_autoscroll during handle_mouse).
@@ -537,7 +601,92 @@ impl App {
         self.state.mode == Mode::RenamePane
     }
 
+    fn handle_tab_double_click(&mut self, mouse: MouseEvent) -> bool {
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            self.last_tab_click = None;
+            return false;
+        }
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+
+        if !mouse.modifiers.is_empty()
+            || !matches!(
+                self.state.mode,
+                Mode::Terminal | Mode::Navigate | Mode::Prefix
+            )
+        {
+            self.last_tab_click = None;
+            return false;
+        }
+
+        let target = self
+            .state
+            .active
+            .zip(self.state.tab_at(mouse.column, mouse.row))
+            .or_else(|| {
+                // Sidebar tab rows are found by row alone, so the click has
+                // to be inside the sidebar first; otherwise any row lined up
+                // with one, in the agent table or a pane, would count.
+                let sidebar = self.state.view.sidebar_rect;
+                let in_sidebar = mouse.column >= sidebar.x
+                    && mouse.column < sidebar.x + sidebar.width
+                    && mouse.row >= sidebar.y
+                    && mouse.row < sidebar.y + sidebar.height;
+                // Only the name renames the tab. The preview arrow is a
+                // toggle, so pressing it twice folds and unfolds, and the
+                // preview picks panes, so a second press there picks again.
+                let on_arrow = self
+                    .state
+                    .tab_preview_toggle_at(mouse.column, mouse.row)
+                    .is_some();
+                let on_preview = self
+                    .state
+                    .tab_preview_target_at(mouse.column, mouse.row)
+                    .is_some();
+                (in_sidebar && !on_arrow && !on_preview)
+                    .then(|| self.state.tab_row_target_at(mouse.row))
+                    .flatten()
+            });
+        let Some((ws_idx, tab_idx)) = target else {
+            self.last_tab_click = None;
+            return false;
+        };
+        let click = super::TabClickState {
+            ws_idx,
+            tab_idx,
+            row: mouse.row,
+            col: mouse.column,
+            at: std::time::Instant::now(),
+        };
+        if !self
+            .last_tab_click
+            .is_some_and(|last| last.is_double_click_for(click))
+        {
+            self.last_tab_click = Some(click);
+            return false;
+        }
+
+        self.last_tab_click = None;
+        self.state.tab_press = None;
+        self.state.drag = None;
+        modal::open_rename_tab(&mut self.state, ws_idx, tab_idx);
+        self.state.mode == Mode::RenameTab
+    }
+
     fn handle_modified_url_click(&mut self, mouse: MouseEvent) -> bool {
+        if self.url_click_in_progress {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => return true,
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.url_click_in_progress = false;
+                    return true;
+                }
+                _ => self.url_click_in_progress = false,
+            }
+        }
+
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             || !mouse.modifiers.contains(KeyModifiers::CONTROL)
@@ -558,6 +707,7 @@ impl App {
         };
 
         self.last_pane_click = None;
+        self.url_click_in_progress = true;
         if let Err(err) = crate::platform::open_url(&url) {
             tracing::warn!(err = %err, url = %url, "failed to open pane URL");
         }
@@ -685,6 +835,7 @@ impl AppState {
         // Actual PTY spawning happens in Workspace::split_focused
         // which needs events channel — this is called from navigate_key
         // where we don't have async context, so the workspace handles it
+        let _ = self.commit_peek_into_layout();
         let (rows, cols) = self.estimate_pane_size();
         let new_rows = (rows / 2).max(4);
         let new_cols = (cols / 2).max(10);

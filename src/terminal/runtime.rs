@@ -376,6 +376,18 @@ impl TerminalRuntime {
         self.0.foreground_cwd()
     }
 
+    pub(crate) fn foreground_command(&self) -> Option<String> {
+        self.0.foreground_command()
+    }
+
+    pub(crate) fn ssh_host(&self) -> Option<String> {
+        self.0.ssh_host()
+    }
+
+    pub(crate) fn shell_name(&self) -> Option<String> {
+        self.0.shell_name()
+    }
+
     pub(crate) fn foreground_interop_shell(&self) -> Option<String> {
         self.0.foreground_interop_shell()
     }

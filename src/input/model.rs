@@ -44,6 +44,7 @@ pub struct PhysicalKeyId(u32);
 /// enable ran in this process yet. Crossterm restores a saved console mode
 /// on disable, and that saved mode only exists after an enable in the same
 /// process, so this specific cold-disable error is a no-op, not a failure.
+#[cfg(any(windows, test))]
 fn is_windows_cold_mouse_disable_error(err: &std::io::Error) -> bool {
     err.to_string() == "Initial console modes not set"
 }

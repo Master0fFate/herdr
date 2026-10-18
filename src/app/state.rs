@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use crate::config::{Keybinds, NewTerminalCwdConfig, SoundConfig, ToastConfig, ToastDelivery};
+use crate::config::{
+    Keybinds, NewTerminalCwdConfig, PaneHeaderConfig, SoundConfig, ToastConfig, ToastDelivery,
+};
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 use ratatui::style::Color;
@@ -619,6 +621,99 @@ impl Palette {
     }
 }
 
+/// Which field of the describe dialog has the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribeField {
+    /// The purpose of a space or the goal of a tab.
+    Text,
+    Name,
+    Directory,
+}
+
+/// What the describe dialog is describing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescribeTarget {
+    NewSpace,
+    /// An existing space, by its stable id.
+    Space {
+        id: String,
+    },
+    /// A tab about to be made in the active space.
+    NewTab,
+    /// An existing tab: its space's stable id and its place in that space.
+    Tab {
+        space_id: String,
+        tab_idx: usize,
+    },
+}
+
+impl DescribeTarget {
+    pub fn is_tab(&self) -> bool {
+        matches!(self, DescribeTarget::NewTab | DescribeTarget::Tab { .. })
+    }
+
+    pub fn is_new(&self) -> bool {
+        matches!(self, DescribeTarget::NewSpace | DescribeTarget::NewTab)
+    }
+}
+
+/// The dialog that asks what a space or a tab is for.
+///
+/// A space's answer is its purpose and a tab's is its goal; both are a few
+/// lines of free text, and that text area is the one field every use of the
+/// dialog has. Making something asks a little more. A new space is asked
+/// which directory it starts in, picked the way the launcher picks one, so the
+/// dialog carries its own copy of the launcher's folder list; a copy, so
+/// choosing here never changes the folder the launcher has on show. A new tab
+/// is asked for an optional name. Editing an existing space or tab asks only
+/// the text, because its directory is where its panes already run and its
+/// name has its own Rename.
+#[derive(Debug, Clone)]
+pub struct DescribeDialogState {
+    pub target: DescribeTarget,
+    /// The purpose or goal.
+    pub text: crate::composer::TextField,
+    /// The name field. Present only when making a tab.
+    pub name: Option<crate::composer::TextField>,
+    /// The folder picker. Present only when making a space.
+    pub folders: Option<crate::composer::ComposerState>,
+    pub field: DescribeField,
+    /// Why the last attempt to settle a directory failed, shown under it.
+    pub error: Option<String>,
+}
+
+impl DescribeDialogState {
+    pub fn new(target: DescribeTarget) -> Self {
+        Self {
+            name: (target == DescribeTarget::NewTab).then(Default::default),
+            target,
+            text: Default::default(),
+            folders: None,
+            field: DescribeField::Text,
+            error: None,
+        }
+    }
+
+    /// The fields in the order `Tab` walks them.
+    pub fn fields(&self) -> Vec<DescribeField> {
+        let mut fields = vec![DescribeField::Text];
+        if self.name.is_some() {
+            fields.push(DescribeField::Name);
+        }
+        if self.folders.is_some() {
+            fields.push(DescribeField::Directory);
+        }
+        fields
+    }
+
+    pub fn step_field(&mut self, delta: isize) {
+        let fields = self.fields();
+        let at = fields.iter().position(|f| *f == self.field).unwrap_or(0) as isize;
+        let len = fields.len() as isize;
+        self.field = fields[((at + delta) % len + len) as usize % fields.len()];
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
     pub source_workspace_id: String,
@@ -790,10 +885,25 @@ pub struct PaneTitleHitArea {
     pub rect: Rect,
 }
 
+/// One pane to open in its own window, over the cells it occupies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanePopOutRequest {
+    /// Public id of the pane's terminal.
+    pub terminal_id: String,
+    /// The pane's name as its title shows it.
+    pub title: String,
+    /// The pane's outer rect, border included, in client screen cells.
+    pub rect: Rect,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaneChromeAction {
+    /// Open the pane in its own window in the host terminal.
+    PopOut,
     Focus,
     Close,
+    /// The finished agent's dot or check on the title: turns one into the other.
+    Acknowledge,
 }
 
 #[derive(Clone, Copy)]
@@ -810,6 +920,14 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
+/// Clickable region for a tab row nested under its space card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabRowArea {
+    pub ws_idx: usize,
+    pub tab_idx: usize,
+    pub rect: Rect,
+}
+
 /// Clickable region for an agent row nested under its space card. The rect
 /// covers only the entry's content rows, not the leading gap row and not the
 /// folder header row above it.
@@ -823,6 +941,16 @@ pub struct AgentRowArea {
     /// heads. Agents listed under it in the same folder share that one header,
     /// so only the first of them carries it.
     pub location_header: bool,
+}
+
+/// Clickable region for a pane with no agent in it, listed under its tab after
+/// that tab's agents. It covers the one line holding its name and command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneRowArea {
+    pub ws_idx: usize,
+    pub tab_idx: usize,
+    pub pane_id: PaneId,
+    pub rect: Rect,
 }
 
 /// The folder row a space's agents are listed under. It is a label rather than
@@ -862,8 +990,10 @@ pub struct ViewState {
     /// Left column of space cards and the agents under them.
     pub sidebar_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
+    pub tab_row_areas: Vec<TabRowArea>,
     pub agent_row_areas: Vec<AgentRowArea>,
     pub agent_folder_areas: Vec<AgentFolderArea>,
+    pub pane_row_areas: Vec<PaneRowArea>,
     /// The agent table between the composer and the panes: where its rows and
     /// columns sit, and which agent each row is.
     pub agent_table: crate::ui::AgentTableLayout,
@@ -872,6 +1002,17 @@ pub struct ViewState {
     /// pane's current folder comes from, so it reads that folder from here —
     /// and so does the paint that writes the row.
     pub agent_locations: std::collections::HashMap<PaneId, crate::ui::AgentLocation>,
+    /// The machine each shown pane is logged into over ssh, as of the last
+    /// frame, for the hostname in its title. A pane on this machine has no
+    /// entry. Kept here for the same reason as `agent_locations`: the title is
+    /// laid out from `AppState` alone.
+    pub ssh_hosts: std::collections::HashMap<PaneId, String>,
+    /// Tab strip under the agent table: hit areas for tabs, scroll, and +.
+    pub tab_bar_rect: Rect,
+    pub tab_hit_areas: Vec<Rect>,
+    pub tab_scroll_left_hit_area: Rect,
+    pub tab_scroll_right_hit_area: Rect,
+    pub new_tab_hit_area: Rect,
     pub terminal_area: Rect,
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
@@ -889,10 +1030,18 @@ impl Default for ViewState {
             composer: crate::ui::ComposerLayout::default(),
             sidebar_rect: Rect::default(),
             workspace_card_areas: Vec::new(),
+            tab_row_areas: Vec::new(),
             agent_row_areas: Vec::new(),
             agent_folder_areas: Vec::new(),
+            pane_row_areas: Vec::new(),
             agent_table: crate::ui::AgentTableLayout::default(),
             agent_locations: std::collections::HashMap::new(),
+            ssh_hosts: std::collections::HashMap::new(),
+            tab_bar_rect: Rect::default(),
+            tab_hit_areas: Vec::new(),
+            tab_scroll_left_hit_area: Rect::default(),
+            tab_scroll_right_hit_area: Rect::default(),
+            new_tab_hit_area: Rect::default(),
             terminal_area: Rect::default(),
             mobile_header_rect: Rect::default(),
             mobile_menu_hit_area: Rect::default(),
@@ -915,8 +1064,11 @@ pub enum Mode {
     Copy,
     Terminal,
     Composer,
+    Commander,
     RenameWorkspace,
+    RenameTab,
     RenamePane,
+    DescribeDialog,
     NewLinkedWorktree,
     OpenExistingWorktree,
     ConfirmRemoveWorktree,
@@ -1006,6 +1158,7 @@ pub enum SettingsSection {
     Sound,
     Toast,
     PaneLabels,
+    Commander,
     Experiments,
     Integrations,
 }
@@ -1016,6 +1169,7 @@ impl SettingsSection {
         Self::Sound,
         Self::Toast,
         Self::PaneLabels,
+        Self::Commander,
         Self::Integrations,
         Self::Experiments,
     ];
@@ -1026,6 +1180,7 @@ impl SettingsSection {
             Self::Sound => "sound",
             Self::Toast => "toasts",
             Self::PaneLabels => "pane labels",
+            Self::Commander => "commander",
             Self::Experiments => "experiments",
             Self::Integrations => "integrations",
         }
@@ -1036,10 +1191,19 @@ impl SettingsSection {
 pub(crate) enum ExperimentSetting {
     PaneHistory,
     SwitchAsciiInputSourceInPrefix,
+    RefreshSummaryWithGrok,
+    HideAttachedAgents,
+    AcknowledgeOnPaneFocus,
 }
 
 impl ExperimentSetting {
-    pub(crate) const ALL: [Self; 2] = [Self::PaneHistory, Self::SwitchAsciiInputSourceInPrefix];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::PaneHistory,
+        Self::SwitchAsciiInputSourceInPrefix,
+        Self::HideAttachedAgents,
+        Self::AcknowledgeOnPaneFocus,
+        Self::RefreshSummaryWithGrok,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -1047,6 +1211,9 @@ impl ExperimentSetting {
             Self::SwitchAsciiInputSourceInPrefix => {
                 "switch to ascii input source in prefix (macOS)"
             }
+            Self::RefreshSummaryWithGrok => "refresh summary with grok",
+            Self::HideAttachedAgents => "agent list: only agents not in a space",
+            Self::AcknowledgeOnPaneFocus => "acknowledge completion on pane focus",
         }
     }
 
@@ -1056,6 +1223,9 @@ impl ExperimentSetting {
             Self::SwitchAsciiInputSourceInPrefix => {
                 state.switch_ascii_input_source_in_prefix_enabled()
             }
+            Self::RefreshSummaryWithGrok => state.refresh_summary_with_grok(),
+            Self::HideAttachedAgents => state.hide_attached_agents(),
+            Self::AcknowledgeOnPaneFocus => state.acknowledge_on_pane_focus,
         }
     }
 }
@@ -1198,6 +1368,15 @@ pub struct SettingsState {
     pub original_palette: Option<Palette>,
     /// The theme name before opening settings.
     pub original_theme: Option<String>,
+    /// The Refresh Summary prompt field is focused for typing.
+    pub editing_refresh_prompt: bool,
+    /// The next key pressed becomes the Commander's hotkey.
+    pub capturing_commander_key: bool,
+    /// The last key refused during that capture, because a plain key bound
+    /// directly would take over typing in every pane.
+    pub refused_commander_key: Option<String>,
+    /// The Jev API key being typed or pasted, while its field is open.
+    pub editing_jev_key: Option<String>,
 }
 
 pub(crate) enum DragTarget {
@@ -1205,12 +1384,19 @@ pub(crate) enum DragTarget {
         source_ws_idx: usize,
         insert_idx: Option<usize>,
     },
+    TabReorder {
+        ws_idx: usize,
+        source_tab_idx: usize,
+        insert_idx: Option<usize>,
+    },
     /// Reordering an agent row among the agents it shares a folder with in
     /// the sidebar. Display order only — the pane layout is untouched.
+    /// Hovering `+ new` instead flies the pane out into its own space.
     SidebarAgentReorder {
         ws_idx: usize,
         source_pane_id: PaneId,
         insert_idx: Option<usize>,
+        create_space: bool,
     },
     /// Reordering a whole folder, and every agent under it, among its space's
     /// folders. Display order only.
@@ -1224,18 +1410,21 @@ pub(crate) enum DragTarget {
     },
     SidebarDivider,
     /// Reordering the session-wide agent table. This changes presentation
-    /// order only; pane placement and workspace membership stay untouched.
+    /// order only; pane placement and workspace membership stay untouched,
+    /// except hovering `+ new` flies a docked pane out into its own space.
     AgentReorder {
         source_pane_id: PaneId,
         insert_idx: Option<usize>,
+        create_space: bool,
     },
     /// Carrying a set-down agent out of the table. Dropped against a pane's
     /// edge it cuts that pane in two and docks there; dropped over the middle
-    /// it takes the pane whole.
+    /// it takes the pane whole; dropped on `+ new` it becomes its own space.
     AgentDock {
         pane_id: PaneId,
         hovered_pane_id: Option<PaneId>,
         drop_zone: crate::layout::DropZone,
+        create_space: bool,
     },
     PaneSplit {
         path: Vec<bool>,
@@ -1312,6 +1501,13 @@ pub(crate) struct WorkspacePressState {
     pub start_row: u16,
 }
 
+pub(crate) struct TabPressState {
+    pub ws_idx: usize,
+    pub tab_idx: usize,
+    pub start_col: u16,
+    pub start_row: u16,
+}
+
 pub(crate) struct PanePressState {
     pub pane_id: PaneId,
     pub start_col: u16,
@@ -1371,6 +1567,10 @@ pub enum ContextMenuKind {
         is_linked_worktree: bool,
         has_worktree_children: bool,
         collapsed: bool,
+    },
+    Tab {
+        ws_idx: usize,
+        tab_idx: usize,
     },
     /// A row of the agent table. The row is the only handle on the space the
     /// agent works in as well as on the agent itself, so this menu carries
@@ -1444,13 +1644,24 @@ pub struct ContextMenuState {
 impl ContextMenuState {
     pub fn items(&self) -> Vec<String> {
         match &self.kind {
-            ContextMenuKind::Workspace { .. } => vec!["Rename".into(), "Close".into()],
+            ContextMenuKind::Workspace { .. } => {
+                vec!["Rename".into(), "Edit purpose".into(), "Close".into()]
+            }
+            ContextMenuKind::Tab { .. } => {
+                vec![
+                    "New tab".into(),
+                    "Rename".into(),
+                    "Edit goal".into(),
+                    "Close".into(),
+                ]
+            }
             ContextMenuKind::GitWorkspace {
                 is_linked_worktree: false,
                 has_worktree_children: false,
                 ..
             } => vec![
                 "Rename".into(),
+                "Edit purpose".into(),
                 "Close".into(),
                 "New worktree".into(),
                 "Open worktree...".into(),
@@ -1460,6 +1671,7 @@ impl ContextMenuState {
                 ..
             } => vec![
                 "Rename".into(),
+                "Edit purpose".into(),
                 "Close".into(),
                 "Delete worktree checkout...".into(),
             ],
@@ -1470,6 +1682,7 @@ impl ContextMenuState {
                 ..
             } => vec![
                 "Rename".into(),
+                "Edit purpose".into(),
                 "Close group".into(),
                 "New worktree".into(),
                 "Open worktree...".into(),
@@ -1480,7 +1693,11 @@ impl ContextMenuState {
                 },
             ],
             ContextMenuKind::Agent { space, .. } => {
-                let mut items = vec!["Rename agent".into(), "Delete agent".into()];
+                let mut items = vec![
+                    "Rename agent".into(),
+                    "Refresh Summary".into(),
+                    "Delete agent".into(),
+                ];
                 match space {
                     SpaceMenuKind::Plain => {}
                     SpaceMenuKind::Repo => {
@@ -1632,6 +1849,12 @@ pub struct AppState {
         std::collections::HashMap<PaneId, crate::workspace::WorkspaceGitStatusSnapshot>,
     /// Terminal ids whose size is currently owned by a direct attach client.
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
+    /// Whether the terminal the foreground client runs in can open a pane in
+    /// its own window. Pane titles show a POP control only while this holds.
+    pub host_pops_out_panes: bool,
+    /// A pane the person asked to pop out, waiting for the server to send it
+    /// to the client that asked.
+    pub pending_pane_pop_out: Option<PanePopOutRequest>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub workspaces: Vec<Workspace>,
     pub active: Option<usize>,
@@ -1664,10 +1887,20 @@ pub struct AppState {
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
-    pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
+    pub requested_new_tab_goal: Option<String>,
     pub rename_pane_target: Option<PaneId>,
     pub worktree_create: Option<WorktreeCreateState>,
+    pub describe_dialog: Option<DescribeDialogState>,
+    /// Set when the space dialog's create button or Enter asks for the space
+    /// to be made. The event loop owns what making a pane needs.
+    pub request_submit_describe_dialog: bool,
+    /// The space whose card the pointer rests on, which shows its purpose in a
+    /// fly-out beside the sidebar.
+    pub hovered_space: Option<usize>,
+    /// The tab in the tab strip the pointer rests on, which shows its goal in
+    /// a fly-out under it.
+    pub hovered_tab: Option<usize>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
     pub worktree_land: Option<WorktreeLandState>,
@@ -1676,6 +1909,7 @@ pub struct AppState {
     pub worktree_auto_land: bool,
     pub request_land_worktree: Option<usize>,
     pub request_land_agent_prompt: Option<(String, String)>,
+    pub request_refresh_summary: Option<PaneId>,
     pub landing_worktrees: std::collections::HashSet<String>,
     pub landing_failures: std::collections::HashMap<String, String>,
     pub request_complete_onboarding: bool,
@@ -1684,6 +1918,9 @@ pub struct AppState {
     /// The always-visible band that starts agents: where to work, who works,
     /// what to do.
     pub composer: crate::composer::ComposerState,
+    /// The box at the bottom of the frame that turns a typed line into an
+    /// action, and the star carrying its last message to a pane.
+    pub commander: crate::commander::CommanderState,
     pub release_notes: Option<ReleaseNotesState>,
     pub product_announcement: Option<ProductAnnouncementState>,
     pub keybind_help: KeybindHelpState,
@@ -1705,7 +1942,13 @@ pub struct AppState {
     #[allow(dead_code)]
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
+    /// When true, the agent table band is a one-row expand chrome instead of the
+    /// full table, freeing height for tabs and panes.
+    pub agent_table_collapsed: bool,
     pub spaces_collapsed: bool,
+    /// `herdr view usage hide`: every allowance display is off at once, over
+    /// whatever the config switches say. Saved with the session.
+    pub usage_hidden: bool,
     /// Legacy ratio of sidebar height once allocated to the workspaces
     /// section. Kept so older sessions still restore.
     pub sidebar_section_split: f32,
@@ -1714,11 +1957,16 @@ pub struct AppState {
     /// How far down the agent list the table's first drawn row sits. It follows
     /// the focused agent, and a wheel notch over the table moves it directly.
     pub agent_table_scroll: usize,
+    /// Horizontal scroll offset for the active space's tab strip.
+    pub tab_scroll: usize,
+    /// When true, layout recenters the strip on the active tab.
+    pub tab_scroll_follow_active: bool,
     pub mobile_switcher_scroll: usize,
     // View geometry (computed before render, consumed by render + mouse)
     pub view: ViewState,
     pub(crate) drag: Option<DragState>,
     pub(crate) workspace_press: Option<WorkspacePressState>,
+    pub(crate) tab_press: Option<TabPressState>,
     pub(crate) pane_press: Option<PanePressState>,
     pub(crate) agent_press: Option<AgentPressState>,
     pub(crate) sidebar_agent_press: Option<SidebarAgentPressState>,
@@ -1726,8 +1974,8 @@ pub struct AppState {
     /// The row a click picked out, until the next key releases it.
     pub(crate) agent_table_focus: Option<AgentTableFocus>,
     /// An agent shown full-pane over the current layout. The splits underneath
-    /// do not change, so a shell that was on screen keeps running. BACK and HIDE
-    /// clear it. Clicking this row again leaves it showing.
+    /// do not change, so a shell that was on screen keeps running. EXIT
+    /// clears it. Clicking this row again leaves it showing.
     pub(crate) agent_peek: Option<PaneId>,
     /// The agent the delete key has asked about, until enter or escape answers.
     pub(crate) confirm_close_agent: Option<PendingAgentClose>,
@@ -1760,9 +2008,36 @@ pub struct AppState {
     pub hide_cursor_when_unfocused: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
+    pub prompt_new_tab_name: bool,
+    pub acknowledge_on_pane_focus: bool,
     pub nerd_font: bool,
     pub show_agent_labels_on_pane_borders: bool,
+    pub pane_header: PaneHeaderConfig,
+    /// The sidebar allowance block and the 10% alert.
+    pub usage_config: crate::config::UsageDisplayConfig,
+    /// The latest allowance readings, drawn in pane headers and the sidebar.
+    pub usage_snapshot: Option<crate::usage::UsageSnapshot>,
+    /// Epoch seconds the countdowns are worked from. Set once per frame by
+    /// `compute_view`, so drawing reads no clock.
+    pub usage_now: u64,
     pub pane_history_persistence: bool,
+    /// Refresh Summary asks a headless `grok -p` session for a 5–8 word
+    /// headline. Off, it reads the latest prompt from the session log.
+    pub refresh_summary_with_grok: bool,
+    /// The agent lists show only agents that are not in a space.
+    pub hide_attached_agents: bool,
+    /// The TypeSafe key the Commander reads lines with, from `[commander]`
+    /// or the environment. `None` keeps the Commander on its fixed reading.
+    pub jev_api_key: Option<String>,
+    /// The TypeSafe model the Commander asks.
+    pub jev_model: String,
+    /// The model the Commander's planner runs under Claude Code; empty runs
+    /// a line's commands in the order written.
+    pub commander_planner_model: String,
+    /// Prompt sent to that headless session. Empty uses the built-in default.
+    pub refresh_summary_prompt: String,
+    /// Persist the prompt field after it loses focus in Settings.
+    pub request_save_refresh_summary_prompt: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
     pub reveal_hidden_cursor_for_cjk_ime: bool,
@@ -1864,12 +2139,29 @@ impl AppState {
         self.toast_config.delivery
     }
 
-    pub fn agent_border_labels_enabled(&self) -> bool {
-        self.show_agent_labels_on_pane_borders
+    pub fn pane_header(&self) -> PaneHeaderConfig {
+        self.pane_header
     }
 
     pub fn pane_history_persistence_enabled(&self) -> bool {
         self.pane_history_persistence
+    }
+
+    pub fn refresh_summary_with_grok(&self) -> bool {
+        self.refresh_summary_with_grok
+    }
+
+    pub fn hide_attached_agents(&self) -> bool {
+        self.hide_attached_agents
+    }
+
+    pub fn refresh_summary_prompt(&self) -> String {
+        let trimmed = self.refresh_summary_prompt.trim();
+        if trimmed.is_empty() {
+            crate::config::DEFAULT_REFRESH_SUMMARY_PROMPT.to_string()
+        } else {
+            trimmed.to_string()
+        }
     }
 
     pub fn switch_ascii_input_source_in_prefix_enabled(&self) -> bool {
@@ -2069,6 +2361,8 @@ impl AppState {
             detached_agents: Vec::new(),
             detached_git_statuses: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            host_pops_out_panes: false,
+            pending_pane_pop_out: None,
             pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             active: None,
@@ -2092,10 +2386,14 @@ impl AppState {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
-            creating_new_tab: false,
             requested_new_tab_name: None,
+            requested_new_tab_goal: None,
             rename_pane_target: None,
             worktree_create: None,
+            describe_dialog: None,
+            request_submit_describe_dialog: false,
+            hovered_space: None,
+            hovered_tab: None,
             worktree_open: None,
             worktree_remove: None,
             worktree_land: None,
@@ -2104,12 +2402,14 @@ impl AppState {
             worktree_auto_land: false,
             request_land_worktree: None,
             request_land_agent_prompt: None,
+            request_refresh_summary: None,
             landing_worktrees: std::collections::HashSet::new(),
             landing_failures: std::collections::HashMap::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
             composer: crate::composer::ComposerState::default(),
+            commander: crate::commander::CommanderState::default(),
             release_notes: None,
             product_announcement: None,
             keybind_help: KeybindHelpState { scroll: 0 },
@@ -2126,31 +2426,19 @@ impl AppState {
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
+            agent_table_collapsed: false,
             spaces_collapsed: false,
+            usage_hidden: false,
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             agent_table_scroll: 0,
+            tab_scroll: 0,
+            tab_scroll_follow_active: true,
             mobile_switcher_scroll: 0,
-            view: ViewState {
-                layout: ViewLayout::Desktop,
-                composer: crate::ui::ComposerLayout::default(),
-                sidebar_rect: Rect::default(),
-                workspace_card_areas: Vec::new(),
-                agent_row_areas: Vec::new(),
-                agent_folder_areas: Vec::new(),
-                agent_table: crate::ui::AgentTableLayout::default(),
-                agent_locations: std::collections::HashMap::new(),
-                terminal_area: Rect::default(),
-                mobile_header_rect: Rect::default(),
-                mobile_menu_hit_area: Rect::default(),
-                toast_hit_area: Rect::default(),
-                pane_infos: Vec::new(),
-                pane_chrome_controls: Vec::new(),
-                pane_title_hit_areas: Vec::new(),
-                split_borders: Vec::new(),
-            },
+            view: ViewState::default(),
             drag: None,
             workspace_press: None,
+            tab_press: None,
             pane_press: None,
             agent_press: None,
             sidebar_agent_press: None,
@@ -2179,9 +2467,22 @@ impl AppState {
             hide_cursor_when_unfocused: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
+            prompt_new_tab_name: true,
+            acknowledge_on_pane_focus: false,
             nerd_font: false,
             show_agent_labels_on_pane_borders: true,
+            pane_header: PaneHeaderConfig::default(),
+            usage_config: crate::config::UsageDisplayConfig::default(),
+            usage_snapshot: None,
+            usage_now: 0,
             pane_history_persistence: false,
+            refresh_summary_with_grok: false,
+            hide_attached_agents: false,
+            jev_api_key: None,
+            jev_model: "jev-latest".into(),
+            commander_planner_model: "claude-opus-5-5".into(),
+            refresh_summary_prompt: crate::config::DEFAULT_REFRESH_SUMMARY_PROMPT.into(),
+            request_save_refresh_summary_prompt: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),
@@ -2210,6 +2511,10 @@ impl AppState {
                 list: SelectionListState::new(0),
                 original_palette: None,
                 original_theme: None,
+                editing_refresh_prompt: false,
+                capturing_commander_key: false,
+                refused_commander_key: None,
+                editing_jev_key: None,
             },
             integration_recommendations: Vec::new(),
             integration_install_messages: Vec::new(),
@@ -2367,6 +2672,7 @@ mod tests {
             menu.items(),
             vec![
                 "Rename agent",
+                "Refresh Summary",
                 "Delete agent",
                 "Land on main",
                 "Delete agent + worktree",
@@ -2386,6 +2692,7 @@ mod tests {
             items,
             vec![
                 "Rename agent",
+                "Refresh Summary",
                 "Delete agent",
                 "New worktree",
                 "Open worktree...",
@@ -2404,10 +2711,15 @@ mod tests {
         let menu = agent_menu(SpaceMenuKind::Plain);
         assert_eq!(
             menu.items(),
-            vec!["Rename agent", "Delete agent", "Delete agent + worktree",]
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
+            vec![
+                "Rename agent",
+                "Refresh Summary",
+                "Delete agent",
+                "Delete agent + worktree",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
         );
         assert!(!menu.item_enabled(worktree_delete_idx(&menu)));
     }

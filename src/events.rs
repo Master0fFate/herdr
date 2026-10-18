@@ -103,14 +103,52 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// A pane child set the window title with OSC 0 or OSC 2. `title` is
+    /// already stripped of spinner frames and a trailing `grok` label.
+    OscTitleChanged {
+        pane_id: PaneId,
+        title: Option<String>,
+    },
     /// Background git status refresh completed for workspaces.
     GitStatusRefreshed {
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
     },
+    /// Background allowance snapshot or completion of the whole refresh job.
+    UsageRefreshed {
+        /// Snapshot updates carry data; the final completion event carries `None`.
+        snapshot: Option<crate::usage::UsageSnapshot>,
+        /// Only the final event releases the guard, after login/refetch.
+        finished: bool,
+    },
     /// Background agent model info refresh completed for terminals.
     AgentModelRefreshed {
         results: Vec<crate::agent_model::AgentModelRefreshResult>,
+    },
+    /// Refresh Summary finished a headless `grok -p` (or heuristic fallback).
+    SummaryRefreshed {
+        terminal_id: crate::terminal::TerminalId,
+        session_id: String,
+        title: Option<String>,
+    },
+    /// Jev finished cutting a Commander paragraph into commands.
+    CommanderSplit {
+        generation: u64,
+        line: String,
+        result: Result<Vec<String>, String>,
+    },
+    /// The planner finished working out which of a line's commands wait for
+    /// which.
+    CommanderOrdered {
+        generation: u64,
+        line: String,
+        result: Result<crate::commander::order::After, String>,
+    },
+    /// Jev finished reading a Commander line.
+    CommanderRead {
+        generation: u64,
+        line: String,
+        result: Result<crate::commander::plan::Reading, String>,
     },
     /// Background `git worktree add` completed.
     WorktreeAddFinished(WorktreeAddResult),

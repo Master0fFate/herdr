@@ -42,6 +42,35 @@ const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::
 const PANE_TERM: &str = "xterm-256color";
 const PANE_COLORTERM: &str = "truecolor";
 
+#[cfg(unix)]
+fn emit_pty_read_side_effects(
+    pane_id: PaneId,
+    events: &mpsc::Sender<AppEvent>,
+    result: self::terminal::ProcessBytesResult,
+) -> PtyReadResult {
+    for content in result.clipboard_writes {
+        if let Err(err) = events.try_send(AppEvent::ClipboardWrite { content }) {
+            warn!(
+                pane = pane_id.raw(),
+                err = %err,
+                "failed to queue OSC 52 clipboard write"
+            );
+        }
+    }
+    if let Some(title) = result.osc_title {
+        if let Err(err) = events.try_send(AppEvent::OscTitleChanged { pane_id, title }) {
+            warn!(
+                pane = pane_id.raw(),
+                err = %err,
+                "failed to queue OSC title change"
+            );
+        }
+    }
+    PtyReadResult {
+        terminal_responses: result.terminal_responses,
+    }
+}
+
 fn apply_pane_terminal_env(cmd: &mut CommandBuilder) {
     // Each pane is rendered by herdr's own terminal layer, not the outer terminal
     // that launched the app. Advertising the inherited TERM leaks the host terminal
@@ -156,6 +185,78 @@ fn should_clear_agent_for_foreground_shell(
     foreground_is_pane_shell: bool,
 ) -> bool {
     previous_agent.is_some() && new_agent.is_none() && foreground_is_pane_shell
+}
+
+/// A process's command line as a person typed it: `python3 app.py` rather than
+/// `/usr/bin/python3 app.py`. The program keeps only its file name. A process
+/// whose arguments cannot be read falls back to its name.
+fn display_command(process: &crate::platform::ForegroundProcess) -> String {
+    let Some((program, args)) = process
+        .argv
+        .as_deref()
+        .and_then(|argv| argv.split_first())
+        .filter(|(program, _)| !program.is_empty())
+    else {
+        return process.name.clone();
+    };
+    let program = std::path::Path::new(program)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.clone());
+    std::iter::once(program)
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// ssh options that take a value, from OpenSSH's own option string. The value
+/// is either the rest of the same argument (`-p22`) or the next one (`-p 22`).
+const SSH_OPTIONS_WITH_VALUE: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+
+/// The machine an `ssh` command line connects to, as a pane title should name
+/// it: `king` from `ssh aaron@king`. `tailscale ssh king` runs ssh with the
+/// full MagicDNS name, `king.<tailnet>.ts.net.`, so a Tailscale name keeps only
+/// its machine part. Any other name is kept as typed, including an ssh config
+/// alias. `None` means the program is not ssh or names no destination.
+fn ssh_destination_host(argv: &[String]) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    if std::path::Path::new(program).file_name()? != "ssh" {
+        return None;
+    }
+    let mut args = args.iter();
+    let destination = loop {
+        let arg = args.next()?;
+        if arg == "--" {
+            break args.next()?;
+        }
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            break arg;
+        };
+        // Flags can share one argument (`-vp22`); the first that takes a value
+        // takes the rest of it, or the next argument when nothing is left.
+        if let Some(at) = flags.find(|flag| SSH_OPTIONS_WITH_VALUE.contains(flag)) {
+            if at + 1 == flags.len() {
+                args.next()?;
+            }
+        }
+    };
+
+    let (host, has_port) = match destination.strip_prefix("ssh://") {
+        Some(uri) => (uri.split('/').next().unwrap_or(uri), true),
+        None => (destination.as_str(), false),
+    };
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    let host = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or(bracketed),
+        None if has_port => host.split(':').next().unwrap_or(host),
+        None => host,
+    };
+    let host = host.trim_end_matches('.');
+    let host = match host.strip_suffix(".ts.net") {
+        Some(tailnet_name) => tailnet_name.split('.').next().unwrap_or(tailnet_name),
+        None => host,
+    };
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 #[cfg(unix)]
@@ -460,6 +561,7 @@ fn spawn_basic_detection_task(
         let mut acquisition_started_at = None;
         let mut last_content_change_at = None;
         let mut release_was_active = false;
+        let mut last_claude_working_at = None;
         let mut last_detection_text = String::new();
 
         loop {
@@ -468,6 +570,7 @@ fn spawn_basic_detection_task(
                 _ = detect_reset.notified() => {
                     agent_presence = AgentDetectionPresence::from_agent(None);
                     state = AgentState::Unknown;
+                    last_claude_working_at = None;
                     last_visible_blocker = false;
                     last_visible_idle = false;
                     last_visible_working = false;
@@ -562,7 +665,17 @@ fn spawn_basic_detection_task(
             let Some(detection) = detection_update_for_publish(agent, &content, false) else {
                 continue;
             };
-            let new_state = detection.state;
+            // Panes handed to a fresh build run this loop instead of the full
+            // one, so it needs the same smoothing: without it a single
+            // mid-repaint frame reads as the end of a turn.
+            let new_state = crate::terminal::state::stabilize_agent_detection(
+                agent,
+                state,
+                detection,
+                false,
+                now,
+                &mut last_claude_working_at,
+            );
             let visible_blocker = detection.visible_blocker && new_state == AgentState::Blocked;
             let visible_idle = detection.visible_idle && new_state == AgentState::Idle;
             let visible_working = detection.visible_working && new_state == AgentState::Working;
@@ -687,6 +800,9 @@ pub struct PaneRuntime {
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
+    /// The cwd the pane started in, the fallback when Windows cannot read a
+    /// process's cwd. Other platforms always can, so only Windows reads it.
+    #[cfg_attr(not(windows), allow(dead_code))]
     initial_cwd: Option<std::path::PathBuf>,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
@@ -1006,7 +1122,7 @@ pub(crate) fn test_shell_program() -> &'static str {
     }
     #[cfg(not(windows))]
     {
-        "/usr/bin/true"
+        "/bin/sh"
     }
 }
 
@@ -1531,18 +1647,7 @@ impl PaneRuntime {
                         }
                     });
                 }
-                for content in result.clipboard_writes {
-                    if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite { content }) {
-                        warn!(
-                            pane = pane_id.raw(),
-                            err = %err,
-                            "failed to queue OSC 52 clipboard write"
-                        );
-                    }
-                }
-                PtyReadResult {
-                    terminal_responses: result.terminal_responses,
-                }
+                emit_pty_read_side_effects(pane_id, &read_events, result)
             });
             let exit_events = events.clone();
             let on_reader_exit = Box::new(move || {
@@ -1572,6 +1677,8 @@ impl PaneRuntime {
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
+            // A handed-off pane keeps the cwd its process already has.
+            initial_cwd: None,
             detect_handle,
         })
     }
@@ -1667,18 +1774,7 @@ impl PaneRuntime {
                         }
                     });
                 }
-                for content in result.clipboard_writes {
-                    if let Err(err) = events.try_send(AppEvent::ClipboardWrite { content }) {
-                        warn!(
-                            pane = pane_id.raw(),
-                            err = %err,
-                            "failed to send OSC 52 clipboard write"
-                        );
-                    }
-                }
-                PtyReadResult {
-                    terminal_responses: result.terminal_responses,
-                }
+                emit_pty_read_side_effects(pane_id, &events, result)
             });
             PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
                 pane_id: pane_id.raw(),
@@ -2304,16 +2400,10 @@ impl PaneRuntime {
             return Some(reported);
         }
         let pid = self.child_pid.load(Ordering::Relaxed);
-        crate::platform::process_cwd(pid).or_else(|| {
-            #[cfg(windows)]
-            {
-                self.initial_cwd.clone()
-            }
-            #[cfg(not(windows))]
-            {
-                None
-            }
-        })
+        let cwd = crate::platform::process_cwd(pid);
+        #[cfg(windows)]
+        let cwd = cwd.or_else(|| self.initial_cwd.clone());
+        cwd
     }
 
     /// The directory the pane reported with OSC 7.
@@ -2374,6 +2464,42 @@ impl PaneRuntime {
         job.processes.iter().find_map(|process| {
             crate::wsl::interop_shell_program(&process.name, process.argv.as_deref())
         })
+    }
+
+    /// What the pane is running: the command line of the process group that
+    /// holds the terminal, with the program shortened to its file name. `None`
+    /// means the pane's own shell holds it, so nothing is running.
+    pub fn foreground_command(&self) -> Option<String> {
+        let pid = self.child_pid.load(Ordering::Acquire);
+        let pgid = self.foreground_pgid(pid)?;
+        if pgid == pid {
+            return None;
+        }
+        let job = crate::detect::foreground_group_leader_job(pgid)?;
+        let leader = job.processes.into_iter().next()?;
+        Some(display_command(&leader))
+    }
+
+    /// The machine the pane is logged into when `ssh` holds the terminal,
+    /// read from ssh's command line. `None` means the pane is on this machine.
+    pub fn ssh_host(&self) -> Option<String> {
+        let pid = self.child_pid.load(Ordering::Acquire);
+        let pgid = self.foreground_pgid(pid)?;
+        if pgid == pid {
+            return None;
+        }
+        let job = crate::detect::foreground_group_leader_job(pgid)?;
+        let leader = job.processes.into_iter().next()?;
+        ssh_destination_host(leader.argv.as_deref()?)
+    }
+
+    /// The file name of the pane's own shell, which is what the pane shows
+    /// while nothing else holds the terminal.
+    pub fn shell_name(&self) -> Option<String> {
+        let pid = self.child_pid.load(Ordering::Acquire);
+        let job = crate::detect::foreground_group_leader_job(pid)?;
+        let shell = job.processes.into_iter().next()?;
+        Some(shell.name.trim_start_matches('-').to_string())
     }
 
     /// Get the current working directory of the process group controlling the pane PTY.
@@ -3069,6 +3195,74 @@ mod tests {
             false,
             refresh_due
         ));
+    }
+
+    #[test]
+    fn display_command_keeps_arguments_and_shortens_the_program() {
+        let process = |argv: Option<&[&str]>| crate::platform::ForegroundProcess {
+            pid: 1,
+            name: "python3".into(),
+            argv0: None,
+            argv: argv.map(|argv| argv.iter().map(|arg| arg.to_string()).collect()),
+            cmdline: None,
+        };
+        assert_eq!(
+            display_command(&process(Some(&[
+                "/usr/bin/python3",
+                "app.py",
+                "--port",
+                "8000"
+            ]))),
+            "python3 app.py --port 8000"
+        );
+        assert_eq!(
+            display_command(&process(Some(&["npm", "run", "dev"]))),
+            "npm run dev"
+        );
+        assert_eq!(display_command(&process(None)), "python3");
+    }
+
+    #[test]
+    fn ssh_destination_host_names_the_machine_ssh_reaches() {
+        let host = |argv: &[&str]| {
+            ssh_destination_host(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(host(&["ssh", "king"]).as_deref(), Some("king"));
+        assert_eq!(
+            host(&["/usr/bin/ssh", "aaron@king"]).as_deref(),
+            Some("king")
+        );
+        // What `tailscale ssh aaron@oberon ls` runs.
+        assert_eq!(
+            host(&[
+                "ssh",
+                "-o",
+                "UserKnownHostsFile \"/home/aaron/.config/tailscale/ssh_known_hosts\"",
+                "-o",
+                "ProxyCommand \"tailscale\"  nc %h %p",
+                "aaron@oberon.tail949dcf.ts.net.",
+                "ls",
+            ])
+            .as_deref(),
+            Some("oberon")
+        );
+        assert_eq!(
+            host(&["ssh", "-vp", "2222", "-A", "-J", "jump", "box.example.com"]).as_deref(),
+            Some("box.example.com")
+        );
+        assert_eq!(
+            host(&["ssh", "-p2222", "-l", "me", "box"]).as_deref(),
+            Some("box")
+        );
+        assert_eq!(host(&["ssh", "--", "box"]).as_deref(), Some("box"));
+        assert_eq!(
+            host(&["ssh", "ssh://me@box.example.com:2222"]).as_deref(),
+            Some("box.example.com")
+        );
+        assert_eq!(host(&["ssh", "me@[fd7a::1]"]).as_deref(), Some("fd7a::1"));
+        assert_eq!(host(&["ssh", "-p", "22"]), None);
+        assert_eq!(host(&["sshd", "king"]), None);
+        assert_eq!(host(&["mosh", "king"]), None);
     }
 
     #[test]

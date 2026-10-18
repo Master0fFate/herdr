@@ -20,7 +20,7 @@ use super::{
     modal::{
         apply_context_menu_action, apply_global_menu_action, apply_rename_action,
         confirm_close_accept, confirm_close_cancel, global_menu_actions, leave_modal,
-        modal_action_from_buttons, open_global_menu, ModalAction,
+        modal_action_from_buttons, open_global_menu, open_new_tab_dialog, ModalAction,
     },
     settings::SettingsAction,
     ScrollbarClickTarget, PANE_DRAG_THRESHOLD,
@@ -65,6 +65,10 @@ impl AppState {
             return None;
         }
 
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.composer.selecting = false;
+        }
+
         if self.mode == Mode::Terminal
             && self.clickable_toast_at(mouse.column, mouse.row)
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -82,6 +86,21 @@ impl AppState {
 
         if self.mode == Mode::Settings {
             return self.handle_settings_mouse(mouse);
+        }
+
+        if self.mode == Mode::DescribeDialog {
+            super::describe_dialog::handle_describe_dialog_mouse(self, mouse);
+            return None;
+        }
+
+        // The fly-outs follow the pointer across the space cards and tabs. Only
+        // motion moves it; the event still goes on to whatever it is for.
+        if matches!(mouse.kind, MouseEventKind::Moved) {
+            self.hovered_space = self.space_card_at(mouse.column, mouse.row);
+            self.hovered_tab =
+                matches!(self.mode, Mode::Terminal | Mode::Navigate | Mode::Composer)
+                    .then(|| self.tab_at(mouse.column, mouse.row))
+                    .flatten();
         }
 
         // The launcher shares the composer's caption row, so it gets first
@@ -167,8 +186,22 @@ impl AppState {
             && matches!(self.mode, Mode::Terminal | Mode::Navigate | Mode::Composer)
             && rect_contains(self.view.composer.area, mouse.column, mouse.row)
         {
-            self.click_composer(terminal_runtimes, mouse.column, mouse.row);
+            self.click_composer(terminal_runtimes, mouse.column, mouse.row, mouse.modifiers);
             return None;
+        }
+
+        if self.composer.selecting {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.drag_composer_task(mouse.column, mouse.row);
+                    return None;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.release_composer_task();
+                    return None;
+                }
+                _ => {}
+            }
         }
 
         if self.mode == Mode::KeybindHelp {
@@ -435,7 +468,10 @@ impl AppState {
                     return None;
                 }
 
-                if matches!(self.mode, Mode::RenameWorkspace | Mode::RenamePane) {
+                if matches!(
+                    self.mode,
+                    Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane
+                ) {
                     let action = self
                         .rename_modal_inner()
                         .map(crate::ui::rename_button_rects)
@@ -469,14 +505,12 @@ impl AppState {
 
                 if in_sidebar {
                     if self.on_sidebar_toggle(mouse.column, mouse.row) {
-                        self.sidebar_collapsed = !self.sidebar_collapsed;
-                        self.mark_session_dirty();
+                        self.toggle_shown(&crate::app::view::Fold::Sidebar);
                         return None;
                     }
 
                     if self.on_spaces_section_header(mouse.column, mouse.row) {
-                        self.spaces_collapsed = !self.spaces_collapsed;
-                        self.mark_session_dirty();
+                        self.toggle_shown(&crate::app::view::Fold::Spaces);
                         return None;
                     }
 
@@ -535,15 +569,10 @@ impl AppState {
                             && mouse.column == card.rect.x
                             && mouse.column < card.rect.x + card.rect.width
                     }) {
-                        if let Some((key, collapsed)) =
+                        if let Some((key, _)) =
                             crate::ui::workspace_parent_group_state(self, card.ws_idx)
                         {
-                            if collapsed {
-                                self.collapsed_space_keys.remove(&key);
-                            } else {
-                                self.collapsed_space_keys.insert(key);
-                            }
-                            self.mark_session_dirty();
+                            self.toggle_shown(&crate::app::view::Fold::SpaceGroup(key));
                             return None;
                         }
                     }
@@ -567,6 +596,35 @@ impl AppState {
                         return None;
                     }
 
+                    // The arrow only folds the preview; it leaves you where you are.
+                    if let Some((ws_idx, tab_idx)) =
+                        self.tab_preview_toggle_at(mouse.column, mouse.row)
+                    {
+                        self.toggle_tab_layout_preview(ws_idx, tab_idx);
+                        return None;
+                    }
+
+                    if let Some((ws_idx, tab_idx, pane_id)) =
+                        self.tab_preview_target_at(mouse.column, mouse.row)
+                    {
+                        match pane_id {
+                            Some(pane_id) => {
+                                self.focus_pane_in_workspace(ws_idx, pane_id);
+                            }
+                            None => {
+                                self.switch_workspace_tab(ws_idx, tab_idx);
+                            }
+                        }
+                        self.mode = Mode::Terminal;
+                        return None;
+                    }
+
+                    if let Some((ws_idx, tab_idx)) = self.tab_row_target_at(mouse.row) {
+                        self.switch_workspace_tab(ws_idx, tab_idx);
+                        self.mode = Mode::Terminal;
+                        return None;
+                    }
+
                     if let Some((ws_idx, _tab_idx, pane_id)) =
                         self.agent_detail_target_at(mouse.row)
                     {
@@ -580,21 +638,38 @@ impl AppState {
                         self.mode = Mode::Terminal;
                         return None;
                     }
+
+                    if let Some((ws_idx, pane_id)) = self.pane_row_target_at(mouse.row) {
+                        self.focus_pane_in_workspace(ws_idx, pane_id);
+                        self.mode = Mode::Terminal;
+                        return None;
+                    }
                     return None;
                 }
 
                 if !in_table {
                     if let Some(control) = self.pane_chrome_control_at(mouse.column, mouse.row) {
+                        // The status mark toggles the check and nothing else,
+                        // as it does in the agent table: acknowledging an
+                        // agent is not also focusing it.
+                        if control.action == crate::app::state::PaneChromeAction::Acknowledge {
+                            self.toggle_agent_completion_acknowledgement(control.pane_id);
+                            return None;
+                        }
                         if self.agent_peek.is_some() {
                             self.clear_agent_peek();
                             return None;
                         }
                         self.focus_pane(control.pane_id);
                         match control.action {
+                            crate::app::state::PaneChromeAction::PopOut => {
+                                self.request_pane_pop_out(control.pane_id);
+                            }
                             crate::app::state::PaneChromeAction::Focus => self.toggle_zoom(),
                             crate::app::state::PaneChromeAction::Close => {
                                 self.close_pane();
                             }
+                            crate::app::state::PaneChromeAction::Acknowledge => {}
                         }
                         return None;
                     }
@@ -609,15 +684,13 @@ impl AppState {
                             });
                             return None;
                         }
-                        if self.pane_swap_enabled() {
-                            self.focus_pane(hit.pane_id);
-                            self.pane_press = Some(PanePressState {
-                                pane_id: hit.pane_id,
-                                start_col: mouse.column,
-                                start_row: mouse.row,
-                            });
-                            return None;
-                        }
+                        self.focus_pane(hit.pane_id);
+                        self.pane_press = Some(PanePressState {
+                            pane_id: hit.pane_id,
+                            start_col: mouse.column,
+                            start_row: mouse.row,
+                        });
+                        return None;
                     }
 
                     if let Some(border) = self.find_border_at(mouse.column, mouse.row) {
@@ -659,6 +732,41 @@ impl AppState {
                     }
                 }
 
+                let collapse = self.view.agent_table.collapse_hit_area;
+                if collapse.width > 0
+                    && mouse.row >= collapse.y
+                    && mouse.row < collapse.y + collapse.height
+                    && mouse.column >= collapse.x
+                    && mouse.column < collapse.x + collapse.width
+                {
+                    self.toggle_shown(&crate::app::view::Fold::AgentTable);
+                    return None;
+                }
+
+                if self.on_tab_scroll_left_button(mouse.column, mouse.row) {
+                    self.scroll_tabs_left();
+                    return None;
+                }
+                if self.on_tab_scroll_right_button(mouse.column, mouse.row) {
+                    self.scroll_tabs_right();
+                    return None;
+                }
+                if let (Some(ws_idx), Some(tab_idx)) =
+                    (self.active, self.tab_at(mouse.column, mouse.row))
+                {
+                    self.tab_press = Some(crate::app::state::TabPressState {
+                        ws_idx,
+                        tab_idx,
+                        start_col: mouse.column,
+                        start_row: mouse.row,
+                    });
+                    return None;
+                }
+                if self.on_new_tab_button(mouse.column, mouse.row) {
+                    open_new_tab_dialog(self);
+                    return None;
+                }
+
                 if in_table {
                     if let Some(column) = self
                         .view
@@ -669,11 +777,11 @@ impl AppState {
                         return None;
                     }
                     // The done marker is a button before it is part of a row:
-                    // clicking it takes the marker off and nothing else, so the
+                    // clicking it toggles the check and nothing else, so the
                     // click that acknowledges an agent is not also the click
                     // that jumps to it.
                     if let Some(hit) = self.agent_marker_target_at(mouse.column, mouse.row) {
-                        if self.acknowledge_agent_completion(hit.pane_id) {
+                        if self.toggle_agent_completion_acknowledgement(hit.pane_id) {
                             return None;
                         }
                     }
@@ -758,9 +866,7 @@ impl AppState {
                     if let Some(press) = &self.pane_press {
                         let delta_col = mouse.column.abs_diff(press.start_col);
                         let delta_row = mouse.row.abs_diff(press.start_row);
-                        if self.pane_swap_enabled()
-                            && delta_col.max(delta_row) >= PANE_DRAG_THRESHOLD
-                        {
+                        if delta_col.max(delta_row) >= PANE_DRAG_THRESHOLD {
                             self.drag = Some(DragState {
                                 target: DragTarget::PaneSwap {
                                     source_pane_id: press.pane_id,
@@ -783,6 +889,7 @@ impl AppState {
                                         mouse.row,
                                         press.pane_id,
                                     ),
+                                    create_space: false,
                                 },
                             });
                         }
@@ -799,6 +906,7 @@ impl AppState {
                                         press.pane_id,
                                         mouse.row,
                                     ),
+                                    create_space: false,
                                 },
                             });
                         }
@@ -830,12 +938,27 @@ impl AppState {
                                 },
                             });
                         }
+                    } else if let Some(press) = &self.tab_press {
+                        let delta_col = mouse.column.abs_diff(press.start_col);
+                        let delta_row = mouse.row.abs_diff(press.start_row);
+                        if delta_col.max(delta_row) >= PANE_DRAG_THRESHOLD {
+                            self.drag = Some(DragState {
+                                target: DragTarget::TabReorder {
+                                    ws_idx: press.ws_idx,
+                                    source_tab_idx: press.tab_idx,
+                                    insert_idx: self.tab_drop_index_at(mouse.column, mouse.row),
+                                },
+                            });
+                            self.tab_press = None;
+                        }
                     }
                 }
 
-                // A table-row drag rearranges rows, never pane geometry. A
-                // set-down agent may still be carried out of the table to dock
-                // on a pane, preserving that distinct interaction.
+                // A table-row drag rearranges rows, never pane geometry, except
+                // `+ new` which flies the agent out the same way a pane-name
+                // drag does. A set-down agent may still be carried out of the
+                // table to dock on a pane, or onto `+ new` for a space of its
+                // own.
                 if let Some(press) = self.agent_press.as_ref() {
                     let pane_id = press.pane_id;
                     let docked = press.docked;
@@ -850,6 +973,7 @@ impl AppState {
                                 target: DragTarget::AgentReorder {
                                     source_pane_id: pane_id,
                                     insert_idx,
+                                    create_space: false,
                                 },
                             });
                         }
@@ -865,6 +989,7 @@ impl AppState {
                                 pane_id,
                                 hovered_pane_id: None,
                                 drop_zone: crate::layout::DropZone::Over,
+                                create_space: false,
                             },
                         });
                     } else if let Some(DragState {
@@ -882,6 +1007,11 @@ impl AppState {
                     Some(*pane_id)
                 });
                 if let Some(source_pane_id) = agent_dock_source {
+                    self.switch_space_while_dragging_pane(
+                        terminal_runtimes,
+                        mouse.column,
+                        mouse.row,
+                    );
                     let hovered =
                         self.pane_swap_hover_target(mouse.column, mouse.row, source_pane_id);
                     let zone = self.pane_drop_zone(hovered, mouse.column, mouse.row);
@@ -906,11 +1036,17 @@ impl AppState {
                     Some(*source_pane_id)
                 });
                 if let Some(source_pane_id) = pane_swap_source {
+                    self.switch_space_while_dragging_pane(
+                        terminal_runtimes,
+                        mouse.column,
+                        mouse.row,
+                    );
                     let hovered =
                         self.pane_swap_hover_target(mouse.column, mouse.row, source_pane_id);
                     let zone = self.pane_drop_zone(hovered, mouse.column, mouse.row);
                     let create_space = hovered.is_none()
-                        && rect_contains(self.sidebar_new_button_rect(), mouse.column, mouse.row);
+                        && rect_contains(self.sidebar_new_button_rect(), mouse.column, mouse.row)
+                        && self.can_fly_pane_to_new_workspace(source_pane_id);
                     if let Some(DragState {
                         target:
                             DragTarget::PaneSwap {
@@ -949,6 +1085,12 @@ impl AppState {
                     }
                     _ => None,
                 };
+                let tab_drop = match self.drag.as_ref().map(|drag| &drag.target) {
+                    Some(DragTarget::TabReorder { .. }) => {
+                        self.tab_drop_index_at(mouse.column, mouse.row)
+                    }
+                    _ => None,
+                };
                 let scrollbar_offset = match self.drag.as_ref().map(|drag| &drag.target) {
                     Some(DragTarget::WorkspaceListScrollbar { grab_row_offset }) => {
                         self.workspace_list_offset_for_drag_row(mouse.row, *grab_row_offset)
@@ -974,17 +1116,25 @@ impl AppState {
                 }) = &mut self.drag
                 {
                     *insert_idx = workspace_drop;
+                } else if let Some(DragState {
+                    target: DragTarget::TabReorder { insert_idx, .. },
+                }) = &mut self.drag
+                {
+                    *insert_idx = tab_drop;
                 } else if let Some(offset) = scrollbar_offset {
                     self.workspace_scroll = offset;
                 } else if resizing_sidebar {
                     self.set_manual_sidebar_width(mouse.column);
                 }
 
+                self.apply_create_space_hover(mouse.column, mouse.row);
+
                 if let Some(drag) = &self.drag {
                     match &drag.target {
                         DragTarget::PaneSwap { .. }
                         | DragTarget::AgentDock { .. }
                         | DragTarget::AgentReorder { .. }
+                        | DragTarget::TabReorder { .. }
                         | DragTarget::WorkspaceReorder { .. }
                         | DragTarget::SidebarAgentReorder { .. }
                         | DragTarget::AgentFolderReorder { .. }
@@ -1072,6 +1222,7 @@ impl AppState {
                 let pane_press = self.pane_press.take();
                 let agent_press = self.agent_press.take();
                 let workspace_press = self.workspace_press.take();
+                let tab_press = self.tab_press.take();
                 self.sidebar_agent_press = None;
                 self.agent_folder_press = None;
                 let drag = self.drag.take();
@@ -1087,10 +1238,32 @@ impl AppState {
                     }
                     Some(DragState {
                         target:
+                            DragTarget::TabReorder {
+                                source_tab_idx,
+                                insert_idx: Some(insert_idx),
+                                ..
+                            },
+                    }) => {
+                        self.move_tab(source_tab_idx, insert_idx);
+                    }
+                    Some(DragState {
+                        target:
+                            DragTarget::SidebarAgentReorder {
+                                source_pane_id,
+                                create_space: true,
+                                ..
+                            },
+                    }) => {
+                        self.fly_pane_to_new_workspace(source_pane_id);
+                        self.mode = Mode::Terminal;
+                    }
+                    Some(DragState {
+                        target:
                             DragTarget::SidebarAgentReorder {
                                 ws_idx,
                                 source_pane_id,
                                 insert_idx: Some(insert_idx),
+                                ..
                             },
                     }) => {
                         self.move_agent_in_folder(ws_idx, source_pane_id, insert_idx);
@@ -1109,7 +1282,19 @@ impl AppState {
                         target:
                             DragTarget::AgentReorder {
                                 source_pane_id,
+                                create_space: true,
+                                ..
+                            },
+                    }) => {
+                        self.fly_pane_to_new_workspace(source_pane_id);
+                        self.mode = Mode::Terminal;
+                    }
+                    Some(DragState {
+                        target:
+                            DragTarget::AgentReorder {
+                                source_pane_id,
                                 insert_idx: Some(insert_idx),
+                                ..
                             },
                     }) => {
                         self.move_agent_to_index(source_pane_id, insert_idx);
@@ -1118,8 +1303,20 @@ impl AppState {
                         target:
                             DragTarget::AgentDock {
                                 pane_id,
+                                create_space: true,
+                                ..
+                            },
+                    }) => {
+                        self.fly_pane_to_new_workspace(pane_id);
+                        self.mode = Mode::Terminal;
+                    }
+                    Some(DragState {
+                        target:
+                            DragTarget::AgentDock {
+                                pane_id,
                                 hovered_pane_id: Some(target_pane_id),
                                 drop_zone,
+                                ..
                             },
                     }) => {
                         self.dock_detached_agent(pane_id, target_pane_id, drop_zone);
@@ -1150,9 +1347,28 @@ impl AppState {
                         self.mode = Mode::Terminal;
                     }
                     Some(DragState {
+                        target:
+                            DragTarget::PaneSwap {
+                                source_pane_id,
+                                moved: true,
+                                ..
+                            },
+                    }) => {
+                        if let Some(ws_idx) =
+                            self.pane_swap_space_under_pointer(mouse.column, mouse.row)
+                        {
+                            self.move_pane_into_workspace(source_pane_id, ws_idx);
+                        } else if self.workspace_index_for_pane(source_pane_id) == self.active {
+                            self.focus_pane(source_pane_id);
+                        }
+                        self.mode = Mode::Terminal;
+                    }
+                    Some(DragState {
                         target: DragTarget::PaneSwap { source_pane_id, .. },
                     }) => {
-                        self.focus_pane(source_pane_id);
+                        if self.workspace_index_for_pane(source_pane_id) == self.active {
+                            self.focus_pane(source_pane_id);
+                        }
                         self.mode = Mode::Terminal;
                     }
                     Some(_) => {}
@@ -1165,6 +1381,13 @@ impl AppState {
                             }
                             self.mode = Mode::Terminal;
                             return None;
+                        }
+                        if let Some(press) = tab_press {
+                            if self.active == Some(press.ws_idx) {
+                                self.switch_tab(press.tab_idx);
+                                self.mode = Mode::Terminal;
+                                return None;
+                            }
                         }
                         if let Some(press) = agent_press.filter(|press| !press.docked) {
                             self.peek_agent(press.pane_id);
@@ -1211,6 +1434,16 @@ impl AppState {
             MouseEventKind::ScrollDown if in_table => self.scroll_agent_table(1),
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if self.on_tab_bar(mouse.column, mouse.row) =>
+            {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => self.previous_tab(),
+                    MouseEventKind::ScrollDown => self.next_tab(),
+                    _ => {}
+                }
+            }
+
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                 if !in_table
                     && !in_sidebar
                     && self.scroll_selection_with_wheel(terminal_runtimes, mouse) => {}
@@ -1243,6 +1476,17 @@ impl AppState {
                     .workspace_list_scrollbar_target_at(mouse.column, mouse.row)
                     .is_some()
                 {
+                    return None;
+                }
+                if let Some((ws_idx, tab_idx)) = self.tab_row_target_at(mouse.row) {
+                    self.switch_workspace_tab(ws_idx, tab_idx);
+                    self.context_menu = Some(ContextMenuState {
+                        kind: ContextMenuKind::Tab { ws_idx, tab_idx },
+                        x: mouse.column,
+                        y: mouse.row,
+                        list: MenuListState::new(0),
+                    });
+                    self.mode = Mode::ContextMenu;
                     return None;
                 }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
@@ -1302,6 +1546,23 @@ impl AppState {
                 }
             }
 
+            MouseEventKind::Down(MouseButton::Right)
+                if self.tab_at(mouse.column, mouse.row).is_some() =>
+            {
+                if let (Some(ws_idx), Some(tab_idx)) =
+                    (self.active, self.tab_at(mouse.column, mouse.row))
+                {
+                    self.switch_tab(tab_idx);
+                    self.context_menu = Some(ContextMenuState {
+                        kind: ContextMenuKind::Tab { ws_idx, tab_idx },
+                        x: mouse.column,
+                        y: mouse.row,
+                        list: MenuListState::new(0),
+                    });
+                    self.mode = Mode::ContextMenu;
+                }
+            }
+
             MouseEventKind::Down(MouseButton::Right) if in_table => {
                 self.pane_press = None;
                 self.agent_press = None;
@@ -1327,28 +1588,20 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right) if !in_table => {
+                if let Some(pane_id) = self.agent_peek {
+                    self.context_menu = Some(ContextMenuState {
+                        kind: self.pane_context_menu_kind(pane_id),
+                        x: mouse.column,
+                        y: mouse.row,
+                        list: MenuListState::new(0),
+                    });
+                    self.mode = Mode::ContextMenu;
+                    return None;
+                }
                 if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
                     self.focus_pane(info.id);
-                    let pane = self
-                        .active
-                        .and_then(|ws_idx| self.workspaces.get(ws_idx))
-                        .and_then(|ws| ws.pane_state(info.id));
-                    let dimmed = pane.is_some_and(|pane| pane.dimmed);
-                    let terminal =
-                        pane.and_then(|pane| self.terminals.get(&pane.attached_terminal_id));
-                    let has_manual_label = terminal
-                        .and_then(|terminal| terminal.manual_label.as_ref())
-                        .is_some();
-                    let has_agent = terminal.is_some_and(|terminal| terminal.is_agent_terminal());
-                    let can_reset = self.agent_reset_command_for_pane(info.id).is_some();
                     self.context_menu = Some(ContextMenuState {
-                        kind: ContextMenuKind::Pane {
-                            pane_id: info.id,
-                            has_manual_label,
-                            dimmed,
-                            has_agent,
-                            can_reset,
-                        },
+                        kind: self.pane_context_menu_kind(info.id),
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
@@ -1416,7 +1669,7 @@ impl AppState {
                 self.mode = Mode::Terminal;
             }
             Some(crate::ui::MobileSwitcherTarget::AcknowledgeAgent { pane_id }) => {
-                self.acknowledge_agent_completion(pane_id);
+                self.toggle_agent_completion_acknowledgement(pane_id);
             }
             Some(crate::ui::MobileSwitcherTarget::Menu(action_idx)) => {
                 let actions = global_menu_actions(self);
@@ -1441,12 +1694,31 @@ impl AppState {
 
     /// The whole frame, worked back out of the surfaces laid out on it. Modals
     /// centre themselves in this rather than in the pane area, so a dialog does
-    /// not shift as the table above the panes grows and shrinks.
+    /// not shift as the table above the panes grows and shrinks. The sidebar is
+    /// part of that frame: without it, a popup drawn on `frame.area()` sits
+    /// left of the hit rects by half the sidebar width.
+    /// The space whose card is under the pointer, while the sidebar is open
+    /// and nothing modal is up.
+    fn space_card_at(&self, col: u16, row: u16) -> Option<usize> {
+        if self.sidebar_collapsed
+            || !matches!(self.mode, Mode::Terminal | Mode::Navigate | Mode::Composer)
+        {
+            return None;
+        }
+        self.view
+            .workspace_card_areas
+            .iter()
+            .find(|card| rect_contains(card.rect, col, row))
+            .map(|card| card.ws_idx)
+    }
+
     pub(super) fn screen_rect(&self) -> Rect {
         let table = self.view.agent_table.area;
         let composer = self.view.composer.area;
         let terminal = self.view.terminal_area;
-        let bands = [composer, table, terminal];
+        let sidebar = self.view.sidebar_rect;
+        let mobile_header = self.view.mobile_header_rect;
+        let bands = [composer, table, terminal, sidebar, mobile_header];
         let placed: Vec<Rect> = bands
             .into_iter()
             .filter(|rect| rect.width > 0 && rect.height > 0)
@@ -1515,6 +1787,117 @@ impl AppState {
         }
     }
 
+    pub(super) fn tab_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .find_map(|(idx, area)| {
+                (area.width > 0
+                    && row >= area.y
+                    && row < area.y + area.height
+                    && col >= area.x
+                    && col < area.x + area.width)
+                    .then_some(idx)
+            })
+    }
+
+    pub(super) fn on_tab_bar(&self, col: u16, row: u16) -> bool {
+        let area = self.view.tab_bar_rect;
+        area.width > 0
+            && row >= area.y
+            && row < area.y + area.height
+            && col >= area.x
+            && col < area.x + area.width
+    }
+
+    pub(super) fn on_tab_scroll_left_button(&self, col: u16, row: u16) -> bool {
+        let area = self.view.tab_scroll_left_hit_area;
+        area.width > 0
+            && row >= area.y
+            && row < area.y + area.height
+            && col >= area.x
+            && col < area.x + area.width
+    }
+
+    pub(super) fn on_tab_scroll_right_button(&self, col: u16, row: u16) -> bool {
+        let area = self.view.tab_scroll_right_hit_area;
+        area.width > 0
+            && row >= area.y
+            && row < area.y + area.height
+            && col >= area.x
+            && col < area.x + area.width
+    }
+
+    pub(super) fn tab_drop_index_at(&self, col: u16, row: u16) -> Option<usize> {
+        if !self.on_tab_bar(col, row) {
+            return None;
+        }
+
+        let visible_tabs: Vec<_> = self
+            .view
+            .tab_hit_areas
+            .iter()
+            .enumerate()
+            .filter(|(_, rect)| rect.width > 0)
+            .collect();
+        let (first_idx, first_rect) = *visible_tabs.first()?;
+        let (last_idx, last_rect) = *visible_tabs.last()?;
+
+        if self.on_tab_scroll_left_button(col, row) {
+            return Some(0);
+        }
+        if self.on_tab_scroll_right_button(col, row) {
+            return self
+                .active
+                .and_then(|idx| self.workspaces.get(idx))
+                .map(|ws| ws.tabs.len());
+        }
+
+        let left_edge = if first_idx == 0 {
+            first_rect.x
+        } else {
+            self.view.tab_scroll_left_hit_area.x + self.view.tab_scroll_left_hit_area.width
+        };
+        let right_edge = if self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .is_some_and(|ws| last_idx + 1 >= ws.tabs.len())
+        {
+            last_rect.x + last_rect.width
+        } else {
+            self.view.tab_scroll_right_hit_area.x.saturating_sub(1)
+        };
+
+        if col <= left_edge {
+            return Some(first_idx);
+        }
+        if col >= right_edge {
+            return Some(last_idx + 1);
+        }
+
+        for (idx, rect) in visible_tabs {
+            let midpoint = rect.x + rect.width / 2;
+            if col < midpoint {
+                return Some(idx);
+            }
+            if col < rect.x + rect.width {
+                return Some(idx + 1);
+            }
+        }
+
+        Some(last_idx + 1)
+    }
+
+    pub(super) fn on_new_tab_button(&self, col: u16, row: u16) -> bool {
+        let area = self.view.new_tab_hit_area;
+        area.width > 0
+            && row >= area.y
+            && row < area.y + area.height
+            && col >= area.x
+            && col < area.x + area.width
+    }
+
     pub(super) fn find_border_at(&self, col: u16, row: u16) -> Option<&SplitBorder> {
         if self.pane_title_hit_at(col, row).is_some() {
             return None;
@@ -1548,6 +1931,34 @@ impl AppState {
     pub(super) fn pane_mouse_target(&self, col: u16, row: u16) -> Option<&PaneInfo> {
         self.pane_at(col, row)
             .or_else(|| self.pane_frame_at(col, row))
+    }
+
+    fn pane_context_menu_kind(&self, pane_id: crate::layout::PaneId) -> ContextMenuKind {
+        let dimmed = self
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.pane_state(pane_id))
+            .map(|pane| pane.dimmed)
+            .or_else(|| {
+                self.detached_agents
+                    .iter()
+                    .find(|detached| detached.pane_id == pane_id)
+                    .map(|detached| detached.pane.dimmed)
+            })
+            .unwrap_or(false);
+        let terminal = self.terminal_state_for_pane(pane_id);
+        let has_manual_label = terminal
+            .and_then(|terminal| terminal.manual_label.as_ref())
+            .is_some();
+        let has_agent = terminal.is_some_and(|terminal| terminal.is_agent_terminal());
+        let can_reset = self.agent_reset_command_for_pane(pane_id).is_some();
+        ContextMenuKind::Pane {
+            pane_id,
+            has_manual_label,
+            dimmed,
+            has_agent,
+            can_reset,
+        }
     }
 
     pub(crate) fn pane_info_by_id(&self, pane_id: crate::layout::PaneId) -> Option<&PaneInfo> {
@@ -1595,17 +2006,91 @@ impl AppState {
         }
     }
 
-    fn pane_swap_enabled(&self) -> bool {
-        let Some(ws_idx) = self.active else {
-            return false;
+    /// Hovering `+ new` while carrying an agent or pane. A docked last pane
+    /// cannot fly out, so it does not light the button.
+    fn apply_create_space_hover(&mut self, col: u16, row: u16) {
+        let pane_id = match self.drag.as_ref().map(|drag| &drag.target) {
+            Some(DragTarget::AgentReorder { source_pane_id, .. }) => Some(*source_pane_id),
+            Some(DragTarget::AgentDock { pane_id, .. }) => Some(*pane_id),
+            Some(DragTarget::SidebarAgentReorder { source_pane_id, .. }) => Some(*source_pane_id),
+            _ => None,
         };
-        let Some(ws) = self.workspaces.get(ws_idx) else {
-            return false;
+        let Some(pane_id) = pane_id else {
+            return;
         };
-        let Some(tab) = ws.active_tab() else {
-            return false;
+        let create_space = rect_contains(self.sidebar_new_button_rect(), col, row)
+            && self.can_fly_pane_to_new_workspace(pane_id);
+        match self.drag.as_mut().map(|drag| &mut drag.target) {
+            Some(DragTarget::AgentReorder {
+                insert_idx,
+                create_space: flag,
+                ..
+            }) => {
+                *flag = create_space;
+                if create_space {
+                    *insert_idx = None;
+                }
+            }
+            Some(DragTarget::AgentDock {
+                hovered_pane_id,
+                create_space: flag,
+                ..
+            }) => {
+                *flag = create_space;
+                if create_space {
+                    *hovered_pane_id = None;
+                }
+            }
+            Some(DragTarget::SidebarAgentReorder {
+                insert_idx,
+                create_space: flag,
+                ..
+            }) => {
+                *flag = create_space;
+                if create_space {
+                    *insert_idx = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The space card under a pane drag, if the pointer is in the sidebar and
+    /// not on `+ new`. Hovering it switches there so the drag can continue onto
+    /// that space's grid.
+    fn pane_swap_space_under_pointer(&self, col: u16, row: u16) -> Option<usize> {
+        let sidebar = self.view.sidebar_rect;
+        if !rect_contains(sidebar, col, row) {
+            return None;
+        }
+        if rect_contains(self.sidebar_new_button_rect(), col, row) {
+            return None;
+        }
+        if self.sidebar_collapsed {
+            self.collapsed_workspace_at_row(row)
+        } else {
+            self.workspace_at_row(row)
+        }
+    }
+
+    fn switch_space_while_dragging_pane(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        col: u16,
+        row: u16,
+    ) {
+        let Some(ws_idx) = self.pane_swap_space_under_pointer(col, row) else {
+            return;
         };
-        !tab.zoomed && tab.layout.pane_count() > 1
+        if self.active == Some(ws_idx) {
+            return;
+        }
+        self.switch_workspace(ws_idx);
+        let area = self.view.sidebar_rect.union(self.screen_rect());
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        crate::ui::compute_view_with_runtime_registry(self, terminal_runtimes, area);
     }
 
     fn pane_swap_hover_target(
@@ -1639,7 +2124,10 @@ impl AppState {
             return None;
         }
         match self.composer.take_typed_folder() {
-            Ok(()) => None,
+            Ok(()) => {
+                self.mark_session_dirty();
+                None
+            }
             Err(err) => Some(err.message()),
         }
     }
@@ -1647,9 +2135,17 @@ impl AppState {
     /// A click in the band takes the keyboard to the control it landed on, and
     /// a click on the folder or the agent opens its list there and then — the
     /// click is the asking to see the choices. A click on a control whose list
-    /// is already open leaves it as it is. A click in the task puts the cursor
-    /// on the character clicked, the way any text field would.
-    fn click_composer(&mut self, terminal_runtimes: &TerminalRuntimeRegistry, col: u16, row: u16) {
+    /// is already open closes it again, the way Escape does, and leaves the
+    /// keyboard on that control. A click in the task puts the cursor
+    /// on the character clicked, the way any text field would. A drag from
+    /// there selects; Shift-click extends an existing selection.
+    fn click_composer(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        col: u16,
+        row: u16,
+        modifiers: crossterm::event::KeyModifiers,
+    ) {
         let was = self.mode;
         self.mode = Mode::Composer;
         let layout = &self.view.composer;
@@ -1664,37 +2160,77 @@ impl AppState {
         };
         let Some(which) = which else {
             self.composer.close_dropdown();
+            self.composer.task.clear_selection();
             if was != Mode::Composer {
                 self.composer.start_where_the_work_is();
             }
             return;
         };
         if self.composer.open == Some(which) {
+            self.composer.close_dropdown();
             return;
         }
         self.composer.close_dropdown();
         self.composer.focus = which;
         if which == crate::composer::Focus::Task {
-            let task = self.view.composer.task;
-            let lead = self.view.composer.task_lead;
-            self.composer.task.click(
-                row.saturating_sub(task.y + 1) as usize,
-                col.saturating_sub(task.x + lead) as usize,
-            );
+            let (text_row, text_col) = self.composer_task_pos(col, row);
+            if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                self.composer.task.extend(text_row, text_col);
+            } else {
+                self.composer.task.click(text_row, text_col);
+            }
+            self.composer.selecting = true;
             return;
         }
+        self.composer.task.clear_selection();
         if which == crate::composer::Focus::Folder {
             self.refresh_composer_folders(terminal_runtimes);
         }
         self.composer.open_dropdown(which);
     }
 
+    fn composer_task_pos(&self, col: u16, row: u16) -> (usize, usize) {
+        let layout = &self.view.composer;
+        let last_row = layout
+            .value_row
+            .saturating_add(layout.task.height.saturating_sub(1));
+        let text_row = if row <= layout.value_row {
+            0
+        } else if row > last_row {
+            last_row.saturating_sub(layout.value_row) as usize
+        } else {
+            row.saturating_sub(layout.value_row) as usize
+        };
+        let text_col = col.saturating_sub(layout.task.x + layout.task_lead) as usize;
+        (text_row, text_col)
+    }
+
+    fn drag_composer_task(&mut self, col: u16, row: u16) {
+        let (text_row, text_col) = self.composer_task_pos(col, row);
+        self.composer.task.drag(text_row, text_col);
+    }
+
+    fn release_composer_task(&mut self) {
+        self.composer.selecting = false;
+        if self.composer.task.has_selection() {
+            if let Some(text) = self.composer.task.selected_text() {
+                self.request_clipboard_write = Some(text.into_bytes());
+            }
+        } else {
+            self.composer.task.clear_selection();
+        }
+    }
+
     fn click_composer_dropdown(&mut self, row: u16) {
         let Some(index) = self.composer_dropdown_item_at(self.view.composer.dropdown.x, row) else {
             return;
         };
+        let folder = self.composer.open == Some(crate::composer::Focus::Folder);
         self.composer.point_at(index);
         self.composer.take_pointed();
+        if folder {
+            self.mark_session_dirty();
+        }
     }
 
     fn composer_dropdown_item_at(&self, col: u16, row: u16) -> Option<usize> {
@@ -1720,21 +2256,16 @@ impl AppState {
     }
 
     /// Put one pane where the drag ended: over another pane, which trades their
-    /// places, or against one of its edges, which cuts that pane in two.
+    /// places, or against one of its edges, which cuts that pane in two. When
+    /// the two panes belong to different spaces, the dragged pane moves into
+    /// the space that was dropped on.
     fn drop_pane_on_pane(
         &mut self,
         source: crate::layout::PaneId,
         target: crate::layout::PaneId,
         zone: crate::layout::DropZone,
     ) {
-        match zone {
-            crate::layout::DropZone::Over => {
-                self.swap_panes(source, target);
-            }
-            crate::layout::DropZone::Edge(side) => {
-                self.pin_pane_to_edge(source, target, side);
-            }
-        }
+        self.move_pane_to_pane(source, target, zone);
     }
 
     /// Where on the hovered pane the pointer is. With nothing hovered there is
@@ -1760,6 +2291,35 @@ impl AppState {
                 && row >= p.rect.y
                 && row < p.rect.y + p.rect.height
         })
+    }
+
+    /// Leaves a request for the server to open `pane_id` in its own window in
+    /// the host terminal, over the cells the pane occupies now.
+    fn request_pane_pop_out(&mut self, pane_id: crate::layout::PaneId) {
+        let Some(ws_idx) = self.active else {
+            return;
+        };
+        let Some(rect) = self
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .map(|info| info.rect)
+        else {
+            return;
+        };
+        let Some(terminal_id) = self.terminal_id_for_pane(ws_idx, pane_id) else {
+            return;
+        };
+        let Some(ws) = self.workspaces.get(ws_idx) else {
+            return;
+        };
+        let title = crate::ui::pane_pop_out_title(self, ws, pane_id);
+        self.pending_pane_pop_out = Some(crate::app::state::PanePopOutRequest {
+            terminal_id: terminal_id.to_string(),
+            title,
+            rect,
+        });
     }
 
     pub(super) fn focus_pane(&mut self, pane_id: crate::layout::PaneId) {
@@ -2156,6 +2716,22 @@ fn apply_scroll(scroll: &mut usize, delta: i16, max_scroll: usize) {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::{Direction, Rect};
+
+    #[test]
+    fn the_drag_and_release_of_a_url_click_do_not_reach_the_pane() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let event = |kind| super::super::mouse(kind, 5, 5);
+        let mut app = app_for_mouse_test();
+        app.url_click_in_progress = true;
+
+        assert!(app.handle_modified_url_click(event(MouseEventKind::Drag(MouseButton::Left))));
+        assert!(app.handle_modified_url_click(event(MouseEventKind::Up(MouseButton::Left))));
+        assert!(!app.url_click_in_progress);
+        assert!(
+            !app.handle_modified_url_click(event(MouseEventKind::Up(MouseButton::Left))),
+            "a later release is an ordinary one again"
+        );
+    }
 
     use super::super::{
         app_for_mouse_test, capture_snapshot, handle_context_menu_key, mouse, numbered_lines_bytes,
@@ -3190,6 +3766,385 @@ mod tests {
         assert_eq!(new_left, right_rect);
         assert_eq!(new_right, left_rect);
     }
+
+    fn app_with_two_spaces_and_a_split() -> (
+        crate::app::App,
+        crate::layout::PaneId,
+        crate::layout::PaneId,
+        crate::layout::PaneId,
+    ) {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let sibling = app.state.workspaces[0].test_split(Direction::Horizontal);
+        let dest = app.state.workspaces[1].tabs[0].root_pane;
+        app.state.ensure_test_terminals();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+        (app, source, sibling, dest)
+    }
+
+    fn drag_pane_title_to(
+        app: &mut crate::app::App,
+        pane_id: crate::layout::PaneId,
+        col: u16,
+        row: u16,
+    ) {
+        let title_hit = app
+            .state
+            .view
+            .pane_title_hit_areas
+            .iter()
+            .find(|hit| hit.pane_id == pane_id)
+            .expect("pane title hit area");
+        let start_col = title_hit.rect.x + title_hit.rect.width / 2;
+        let start_row = title_hit.rect.y;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start_col,
+            start_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            start_col + PANE_DRAG_THRESHOLD,
+            start_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), col, row));
+    }
+
+    #[test]
+    fn dragging_a_pane_name_over_another_space_switches_and_keeps_the_drag() {
+        let (mut app, source, _, _) = app_with_two_spaces_and_a_split();
+        let card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 1)
+            .expect("second space card")
+            .rect;
+
+        drag_pane_title_to(&mut app, source, card.x + 2, card.y + 1);
+
+        assert_eq!(app.state.active, Some(1));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::PaneSwap {
+                source_pane_id,
+                ..
+            }) if *source_pane_id == source
+        ));
+        assert!(
+            app.state.workspaces[0]
+                .find_tab_index_for_pane(source)
+                .is_some(),
+            "the pane stays in the source space until it is dropped"
+        );
+    }
+
+    #[test]
+    fn dragging_a_pane_name_into_another_space_drops_it_on_that_layout() {
+        let (mut app, source, sibling, dest) = app_with_two_spaces_and_a_split();
+        let card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 1)
+            .expect("second space card")
+            .rect;
+
+        drag_pane_title_to(&mut app, source, card.x + 2, card.y + 1);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+
+        let dest_rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|pane| pane.id == dest)
+            .expect("destination pane after the space switch")
+            .rect;
+        let target_col = dest_rect.x + dest_rect.width / 2;
+        let target_row = dest_rect.y + dest_rect.height / 2;
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            target_col,
+            target_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target_col,
+            target_row,
+        ));
+
+        assert_eq!(app.state.active, Some(1));
+        assert!(app.state.workspaces[0].pane_state(source).is_none());
+        assert!(app.state.workspaces[0].pane_state(sibling).is_some());
+        assert!(app.state.workspaces[1].pane_state(source).is_some());
+        assert!(app.state.workspaces[1].pane_state(dest).is_some());
+        assert_eq!(app.state.workspaces[1].focused_pane_id(), Some(source));
+    }
+
+    #[test]
+    fn dropping_a_pane_name_on_another_space_card_moves_it_there() {
+        let (mut app, source, sibling, dest) = app_with_two_spaces_and_a_split();
+        let card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 1)
+            .expect("second space card")
+            .rect;
+        let drop_col = card.x + 2;
+        let drop_row = card.y + 1;
+
+        drag_pane_title_to(&mut app, source, drop_col, drop_row);
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drop_col,
+            drop_row,
+        ));
+
+        assert_eq!(app.state.active, Some(1));
+        assert!(app.state.workspaces[0].pane_state(source).is_none());
+        assert!(app.state.workspaces[0].pane_state(sibling).is_some());
+        assert!(app.state.workspaces[1].pane_state(source).is_some());
+        assert!(app.state.workspaces[1].pane_state(dest).is_some());
+    }
+
+    fn name_split_agents(app: &mut crate::app::App, panes: &[crate::layout::PaneId]) {
+        for pane_id in panes {
+            let terminal_id = app.state.workspaces[0]
+                .pane_state(*pane_id)
+                .expect("agent pane")
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("agent terminal");
+            terminal.set_agent_name("codex".into());
+            terminal.detected_agent = Some(crate::detect::Agent::Codex);
+        }
+    }
+
+    fn new_space_button_point(app: &crate::app::App) -> (u16, u16) {
+        let button = app.state.sidebar_new_button_rect();
+        assert!(
+            button.width > 0 && button.height > 0,
+            "sidebar + new button should be on screen"
+        );
+        (button.x + button.width / 2, button.y + button.height / 2)
+    }
+
+    fn drag_from_to(app: &mut crate::app::App, start: (u16, u16), dest: (u16, u16)) {
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            start.0,
+            start.1,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            start.0 + PANE_DRAG_THRESHOLD,
+            start.1,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            dest.0,
+            dest.1,
+        ));
+    }
+
+    #[test]
+    fn dropping_an_agent_table_row_on_new_space_flies_it_out() {
+        let mut app = app_for_mouse_test();
+        let mut workspace = Workspace::test_new("space");
+        let source = workspace.tabs[0].root_pane;
+        let sibling = workspace.test_split(Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        name_split_agents(&mut app, &[source, sibling]);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 32));
+
+        let table_row = app
+            .state
+            .view
+            .agent_table
+            .rows
+            .iter()
+            .find(|row| row.pane_id == source)
+            .expect("source table row")
+            .rect;
+        let (drop_col, drop_row) = new_space_button_point(&app);
+
+        drag_from_to(
+            &mut app,
+            (table_row.x + 2, table_row.y),
+            (drop_col, drop_row),
+        );
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::AgentReorder {
+                source_pane_id,
+                create_space: true,
+                ..
+            }) if *source_pane_id == source
+        ));
+        assert_eq!(app.state.workspaces.len(), 1);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drop_col,
+            drop_row,
+        ));
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert!(app.state.workspaces[0].pane_state(source).is_none());
+        assert!(app.state.workspaces[0].pane_state(sibling).is_some());
+        assert!(app.state.workspaces[1].pane_state(source).is_some());
+        assert_eq!(app.state.workspaces[1].layout.pane_count(), 1);
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.workspaces[1].focused_pane_id(), Some(source));
+    }
+
+    #[test]
+    fn dropping_a_sidebar_agent_on_new_space_flies_it_out() {
+        let mut app = app_for_mouse_test();
+        let mut workspace = Workspace::test_new("space");
+        let source = workspace.tabs[0].root_pane;
+        let sibling = workspace.test_split(Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        name_split_agents(&mut app, &[source, sibling]);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 32));
+
+        let agent_row = app
+            .state
+            .view
+            .agent_row_areas
+            .iter()
+            .find(|row| row.pane_id == source)
+            .expect("source sidebar row")
+            .rect;
+        let (drop_col, drop_row) = new_space_button_point(&app);
+
+        drag_from_to(
+            &mut app,
+            (agent_row.x + 2, agent_row.y),
+            (drop_col, drop_row),
+        );
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::SidebarAgentReorder {
+                source_pane_id,
+                create_space: true,
+                insert_idx: None,
+                ..
+            }) if *source_pane_id == source
+        ));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drop_col,
+            drop_row,
+        ));
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert!(app.state.workspaces[0].pane_state(source).is_none());
+        assert!(app.state.workspaces[0].pane_state(sibling).is_some());
+        assert!(app.state.workspaces[1].pane_state(source).is_some());
+        assert_eq!(app.state.active, Some(1));
+    }
+
+    #[test]
+    fn dropping_a_hidden_agent_on_new_space_docks_it_there() {
+        let (mut app, pane_id, remaining) = app_with_hidden_agent();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 32));
+        let row = hidden_agent_row(&app, pane_id);
+        let (drop_col, drop_row) = new_space_button_point(&app);
+
+        drag_from_to(&mut app, (row.rect.x + 1, row.rect.y), (drop_col, drop_row));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::AgentDock {
+                pane_id: dragged,
+                create_space: true,
+                hovered_pane_id: None,
+                ..
+            }) if *dragged == pane_id
+        ));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drop_col,
+            drop_row,
+        ));
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert!(app.state.workspaces[0].pane_state(remaining).is_some());
+        assert!(app.state.workspaces[1].pane_state(pane_id).is_some());
+        assert!(app
+            .state
+            .detached_agents
+            .iter()
+            .all(|detached| detached.pane_id != pane_id));
+        assert_eq!(app.state.agent_peek, None);
+        assert_eq!(app.state.active, Some(1));
+    }
+
+    #[test]
+    fn dropping_the_last_docked_agent_on_new_space_leaves_it() {
+        let mut app = app_for_mouse_test();
+        let workspace = Workspace::test_new("space");
+        let source = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        name_split_agents(&mut app, &[source]);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 32));
+
+        let table_row = app
+            .state
+            .view
+            .agent_table
+            .rows
+            .iter()
+            .find(|row| row.pane_id == source)
+            .expect("source table row")
+            .rect;
+        let (drop_col, drop_row) = new_space_button_point(&app);
+
+        drag_from_to(
+            &mut app,
+            (table_row.x + 2, table_row.y),
+            (drop_col, drop_row),
+        );
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::AgentReorder {
+                create_space: false,
+                ..
+            })
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drop_col,
+            drop_row,
+        ));
+
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert!(app.state.workspaces[0].pane_state(source).is_some());
+    }
+
     #[test]
     fn dragging_pane_split_updates_captured_layout_ratio() {
         let mut app = app_for_mouse_test();
@@ -3810,6 +4765,120 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_pane_title_status_mark_toggles_the_check() {
+        let mut app = app_for_mouse_test();
+        let mut workspace = Workspace::test_new("space");
+        let focused = workspace.tabs[0].root_pane;
+        let finished = workspace.test_split(Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        for pane_id in [focused, finished] {
+            let terminal_id = app.state.workspaces[0]
+                .pane_state(pane_id)
+                .expect("agent pane")
+                .attached_terminal_id
+                .clone();
+            let terminal = app
+                .state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("agent terminal");
+            terminal.set_agent_name("codex".into());
+            terminal.state = crate::detect::AgentState::Idle;
+        }
+        app.state.workspaces[0].tabs[0].layout.focus_pane(focused);
+        let pane = app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&finished)
+            .expect("finished pane");
+        pane.seen = false;
+        pane.completed = true;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 30));
+
+        let mark = app
+            .state
+            .view
+            .pane_chrome_controls
+            .iter()
+            .find(|control| {
+                control.pane_id == finished
+                    && control.action == crate::app::state::PaneChromeAction::Acknowledge
+            })
+            .expect("the finished pane's title carries a clickable status mark")
+            .rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            mark.x,
+            mark.y,
+        ));
+        assert!(app.state.workspaces[0].tabs[0].panes[&finished].seen);
+        assert_eq!(
+            app.state.workspaces[0].focused_pane_id(),
+            Some(focused),
+            "acknowledging a finish should not also focus that pane"
+        );
+
+        // The dot spills into the cell to its right, so that cell toggles too.
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            mark.x + 1,
+            mark.y,
+        ));
+        assert!(!app.state.workspaces[0].tabs[0].panes[&finished].seen);
+        assert!(app.state.workspaces[0].tabs[0].panes[&finished].completed);
+    }
+
+    #[test]
+    fn acknowledge_on_focus_clicking_an_already_focused_pane_confirms_completion() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("space")];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state.acknowledge_on_pane_focus = true;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Codex),
+                crate::detect::AgentState::Idle,
+            );
+        let pane = app.state.workspaces[0].pane_state_mut(pane_id).unwrap();
+        pane.seen = false;
+        pane.completed = true;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .unwrap()
+            .inner_rect;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect.x + 2,
+            rect.y + 2,
+        ));
+        assert!(app.state.workspaces[0].pane_state(pane_id).unwrap().seen);
+        assert!(
+            app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .completed
+        );
+    }
+
+    #[test]
     fn clicking_the_done_marker_acknowledges_that_agent_and_nothing_else() {
         let mut app = app_for_mouse_test();
         let mut workspace = Workspace::test_new("space");
@@ -3861,6 +4930,20 @@ mod tests {
             app.state.workspaces[0].focused_pane_id(),
             Some(focused),
             "acknowledging a finish should not also jump to that agent"
+        );
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            row.rect.x,
+            row.rect.y,
+        ));
+
+        assert!(!app.state.workspaces[0].tabs[0].panes[&finished].seen);
+        assert!(app.state.workspaces[0].tabs[0].panes[&finished].completed);
+        assert_eq!(
+            app.state.workspaces[0].focused_pane_id(),
+            Some(focused),
+            "unchecking a finish should not also jump to that agent"
         );
     }
 
@@ -4171,6 +5254,10 @@ mod tests {
             "{items:?}"
         );
         assert!(items.iter().any(|item| item == "Rename agent"), "{items:?}");
+        assert!(
+            items.iter().any(|item| item == "Refresh Summary"),
+            "{items:?}"
+        );
         match &menu.kind {
             ContextMenuKind::Agent {
                 pane_id: menu_pane, ..
@@ -4236,6 +5323,251 @@ mod tests {
             .iter()
             .all(|detached| detached.pane_id != pane_id));
         assert!(app.state.workspaces[0].pane_state(remaining).is_none());
+    }
+
+    #[test]
+    fn right_clicking_a_peeked_pane_opens_its_menu_not_the_layout_underneath() {
+        let (mut app, pane_id, remaining) = app_with_hidden_agent();
+        let row = hidden_agent_row(&app, pane_id);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            row.rect.x + 1,
+            row.rect.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            row.rect.x + 1,
+            row.rect.y,
+        ));
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let inner = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .expect("peeked pane")
+            .inner_rect;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            inner.x + 1,
+            inner.y + 1,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("peeked pane menu");
+        match &menu.kind {
+            ContextMenuKind::Pane {
+                pane_id: menu_pane, ..
+            } => {
+                assert_eq!(*menu_pane, pane_id);
+                assert_ne!(*menu_pane, remaining);
+            }
+            other => panic!("peeked overlay should open its pane menu, got {other:?}"),
+        }
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(remaining));
+        assert_eq!(app.state.agent_peek, Some(pane_id));
+    }
+
+    #[tokio::test]
+    async fn copying_a_selection_on_a_peeked_pane_writes_the_clipboard() {
+        let (mut app, pane_id, remaining) = app_with_hidden_agent();
+        let terminal_id = app
+            .state
+            .terminal_id_for_any_pane(pane_id)
+            .expect("peeked pane terminal");
+        app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                80,
+                24,
+                16 * 1024,
+                &numbered_lines_bytes(8),
+            ),
+        );
+        app.state.peek_agent(pane_id);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let inner = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .expect("peeked pane")
+            .inner_rect;
+        let mut selection = crate::selection::Selection::anchor(pane_id, 0, 0, None);
+        selection.drag(inner.x + 10, inner.y, inner, None);
+        app.state.selection = Some(selection);
+
+        app.state.copy_selection(&app.terminal_runtimes);
+
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(remaining));
+        let copied = app
+            .state
+            .request_clipboard_write
+            .as_ref()
+            .expect("peeked selection should copy");
+        assert!(!copied.is_empty());
+    }
+
+    #[tokio::test]
+    async fn splitting_while_peeking_splits_the_peeked_pane_not_the_layout_underneath() {
+        let (mut app, pane_id, remaining) = app_with_hidden_agent();
+        app.state.default_shell = "/usr/bin/true".into();
+        app.state.peek_agent(pane_id);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        app.state.split_pane_with_placement(
+            &mut app.terminal_runtimes,
+            Direction::Horizontal,
+            crate::layout::SplitPlacement::After,
+        );
+
+        assert_eq!(app.state.agent_peek, None);
+        assert!(app.state.workspaces[0].pane_state(pane_id).is_some());
+        assert!(app.state.workspaces[0].pane_state(remaining).is_none());
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert!(app
+            .state
+            .detached_agents
+            .iter()
+            .any(|detached| detached.pane_id == remaining));
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_single_pane_title_is_a_drag_handle() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let source = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.ensure_test_terminals();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+
+        assert!(
+            app.state
+                .view
+                .pane_title_hit_areas
+                .iter()
+                .any(|hit| hit.pane_id == source),
+            "the only pane in a space still has a name you can drag"
+        );
+    }
+
+    #[test]
+    fn dragging_the_only_pane_into_another_space_moves_it_and_closes_the_empty_one() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let dest = app.state.workspaces[1].tabs[0].root_pane;
+        app.state.ensure_test_terminals();
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+
+        let card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 1)
+            .expect("second space card")
+            .rect;
+        drag_pane_title_to(&mut app, source, card.x + 2, card.y + 1);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+
+        let dest_rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|pane| pane.id == dest)
+            .expect("destination pane after the space switch")
+            .rect;
+        let target_col = dest_rect.x + dest_rect.width / 2;
+        let target_row = dest_rect.y + dest_rect.height / 2;
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            target_col,
+            target_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target_col,
+            target_row,
+        ));
+
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert!(app.state.workspaces[0].pane_state(source).is_some());
+        assert!(app.state.workspaces[0].pane_state(dest).is_some());
+        assert_eq!(app.state.active, Some(0));
+    }
+
+    #[test]
+    fn dragging_a_peeked_title_into_another_space_docks_it_there() {
+        let (mut app, pane_id, remaining) = app_with_hidden_agent();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        let dest = app.state.workspaces[1].tabs[0].root_pane;
+        app.state.ensure_test_terminals();
+        let row = hidden_agent_row(&app, pane_id);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            row.rect.x + 1,
+            row.rect.y,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            row.rect.x + 1,
+            row.rect.y,
+        ));
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+
+        let card = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .find(|card| card.ws_idx == 1)
+            .expect("second space card")
+            .rect;
+        drag_pane_title_to(&mut app, pane_id, card.x + 2, card.y + 1);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+
+        let dest_rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|pane| pane.id == dest)
+            .expect("destination pane after the space switch")
+            .rect;
+        let target_col = dest_rect.x + dest_rect.width / 2;
+        let target_row = dest_rect.y + dest_rect.height / 2;
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            target_col,
+            target_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target_col,
+            target_row,
+        ));
+
+        assert_eq!(app.state.agent_peek, None);
+        assert!(app.state.workspaces[0].pane_state(remaining).is_some());
+        assert!(app.state.workspaces[0].pane_state(pane_id).is_none());
+        assert!(app.state.workspaces[1].pane_state(pane_id).is_some());
+        assert!(app
+            .state
+            .detached_agents
+            .iter()
+            .all(|detached| detached.pane_id != pane_id));
     }
 
     #[tokio::test]
@@ -4400,7 +5732,7 @@ mod tests {
         }
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
         let heading = app.state.view.agent_table.area.y;
-        let directory = app.state.view.agent_table.groups[0].columns[2];
+        let directory = app.state.view.agent_table.groups[0].columns[1];
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -4668,6 +6000,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dragging_in_the_task_field_selects_the_text_and_copies_it() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("space")];
+        app.state.active = Some(0);
+        app.state.mode = Mode::Composer;
+        app.state
+            .composer
+            .add_folder(std::path::PathBuf::from("/tmp"));
+        app.state.composer.task.set_text("fix the tests");
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+
+        let task = app.state.view.composer.task;
+        let lead = app.state.view.composer.task_lead;
+        let row = app.state.view.composer.value_row;
+        let start = task.x + lead + 4;
+        let end = task.x + lead + 7;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), start, row));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), end, row));
+
+        assert_eq!(
+            app.state.composer.task.selected_text().as_deref(),
+            Some("the")
+        );
+
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), end, row));
+
+        assert_eq!(
+            app.state.composer.task.selected_text().as_deref(),
+            Some("the"),
+            "the highlight stays after copy"
+        );
+        match app.event_rx.try_recv().expect("clipboard write event") {
+            crate::events::AppEvent::ClipboardWrite { content } => {
+                assert_eq!(content, b"the");
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+
     #[test]
     fn moving_over_composer_dropdown_rows_sets_hover_without_selecting() {
         let mut app = app_for_mouse_test();
@@ -4710,6 +6083,44 @@ mod tests {
         assert_eq!(app.state.composer.hover, Some(1));
         assert_eq!(app.state.composer.highlight, 0);
         assert_eq!(app.state.composer.open, Some(crate::composer::Focus::Agent));
+    }
+
+    #[test]
+    fn clicking_an_open_control_again_closes_its_list() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("space")];
+        app.state.active = Some(0);
+        app.state
+            .composer
+            .use_harnesses(vec![&crate::harness::ALL[0], &crate::harness::ALL[1]]);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+
+        for which in [
+            crate::composer::Focus::Folder,
+            crate::composer::Focus::Agent,
+        ] {
+            let control = match which {
+                crate::composer::Focus::Folder => app.state.view.composer.folder,
+                _ => app.state.view.composer.agent,
+            };
+            let (col, row) = (control.x + 1, app.state.view.composer.value_row);
+
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+            crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+            assert_eq!(
+                app.state.composer.open,
+                Some(which),
+                "the first click opens it"
+            );
+
+            app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+            crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 120, 30));
+            assert_eq!(app.state.composer.open, None, "the second click closes it");
+            assert_eq!(
+                app.state.composer.focus, which,
+                "and keeps the keyboard there"
+            );
+        }
     }
 
     #[test]

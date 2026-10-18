@@ -69,6 +69,7 @@ impl KittyKeyboardTracker {
         }
     }
 
+    #[cfg(windows)]
     pub(crate) fn flags(&self) -> u16 {
         self.flags
     }

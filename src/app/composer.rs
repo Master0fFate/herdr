@@ -26,27 +26,13 @@ impl App {
     /// thing the band exists to avoid. The new pane takes the keyboard, so the
     /// next keys go to the agent that received the task.
     pub(crate) fn submit_composer(&mut self, pending: Pending) {
-        let result = match pending.launch() {
-            Launch::Agent { agent, argv }
-                if pending.worktree
-                    && pending.harness.prefix != crate::harness::AUTO_PREFIX
-                    && crate::workspace::git_space_metadata(&pending.cwd)
-                        .is_some_and(|space| !space.is_linked_worktree) =>
-            {
-                self.start_managed_worktree_agent(&pending.cwd, &argv, agent)
-            }
-            Launch::Agent { agent, argv } => self
-                .start_hidden_agent(pending.cwd.clone(), &argv, Some(agent))
-                .map(|pane_id| (pane_id, pending.cwd.clone())),
-            Launch::Terminal { command } => self
-                .start_hidden_terminal(pending.cwd.clone(), &command)
-                .map(|pane_id| (pane_id, pending.cwd.clone())),
-        }
-        .map_err(|err| self.agent_start_error_body(err).message);
+        let result = self.start_pending(&pending);
         match result {
             Ok((pane_id, started_cwd)) => {
                 self.state.composer.task.clear();
                 self.state.composer.add_folder(pending.cwd.clone());
+                self.state.composer.mark_used(pending.cwd.clone());
+                crate::persist::save_used_folders(self.state.composer.used_folders());
                 self.focus_composer_started_agent(pane_id, pending.worktree);
                 let where_it_went = crate::workspace::display_path_with_home(&started_cwd);
                 self.show_composer_toast(
@@ -67,6 +53,31 @@ impl App {
         }
     }
 
+    /// Start what `pending` holds, without touching the band. Returns the new
+    /// pane and the folder it started in, or why it could not start.
+    pub(crate) fn start_pending(
+        &mut self,
+        pending: &Pending,
+    ) -> Result<(crate::layout::PaneId, PathBuf), String> {
+        match pending.launch() {
+            Launch::Agent { agent, argv }
+                if pending.worktree
+                    && pending.harness.prefix != crate::harness::AUTO_PREFIX
+                    && crate::workspace::git_space_metadata(&pending.cwd)
+                        .is_some_and(|space| !space.is_linked_worktree) =>
+            {
+                self.start_managed_worktree_agent(&pending.cwd, &argv, agent)
+            }
+            Launch::Agent { agent, argv } => self
+                .start_hidden_agent(pending.cwd.clone(), &argv, Some(agent))
+                .map(|pane_id| (pane_id, pending.cwd.clone())),
+            Launch::Terminal { command } => self
+                .start_hidden_terminal(pending.cwd.clone(), &command)
+                .map(|pane_id| (pane_id, pending.cwd.clone())),
+        }
+        .map_err(|err| self.agent_start_error_body(err).message)
+    }
+
     /// Put the keyboard on the agent the band just started.
     ///
     /// A worktree start stays hidden and peeks over the layout that was
@@ -75,7 +86,11 @@ impl App {
     /// over: replacing would end a shell that was being looked at. If the pane
     /// is too small to cut, the new agent takes it the same way clicking its
     /// row would.
-    fn focus_composer_started_agent(&mut self, pane_id: crate::layout::PaneId, peek: bool) {
+    pub(super) fn focus_composer_started_agent(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        peek: bool,
+    ) {
         if peek && self.find_pane(pane_id).is_none() {
             self.state.peek_agent(pane_id);
         } else if let Some((ws_idx, _)) = self.find_pane(pane_id) {
@@ -103,7 +118,7 @@ impl App {
         self.show_composer_toast(ToastKind::NeedsAttention, "composer", reason, None);
     }
 
-    fn show_composer_toast(
+    pub(super) fn show_composer_toast(
         &mut self,
         kind: ToastKind,
         title: &str,
@@ -148,7 +163,9 @@ impl crate::app::AppState {
     /// a space that closes takes its folder off the list and there is no second
     /// record of where the work is to fall out of step with the first. A folder
     /// typed by hand is the one exception: it is kept until something runs in
-    /// it, because it was put there to be started in.
+    /// it, because it was put there to be started in. The folder on show is also
+    /// written with the session, so a restart puts it back even when nothing is
+    /// running in it yet.
     ///
     /// This is asked for at the moments the list is consulted — reaching the
     /// band, and opening its folder list — rather than on every frame. A pane's
@@ -374,5 +391,16 @@ mod tests {
             .args(["worktree", "remove", "--force", second.to_str().unwrap()])
             .status();
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn a_chosen_folder_stays_on_show_when_no_pane_is_in_it() {
+        let mut state = AppState::test_new();
+        let folder = std::env::temp_dir();
+        state.composer.add_folder(folder.clone());
+
+        state.refresh_composer_folders(&TerminalRuntimeRegistry::default());
+
+        assert_eq!(state.composer.folder_path(), Some(folder.as_path()));
     }
 }

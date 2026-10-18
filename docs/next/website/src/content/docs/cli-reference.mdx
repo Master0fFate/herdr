@@ -33,6 +33,27 @@ herdr status server
 herdr status client
 ```
 
+## Account allowances
+
+```bash
+herdr usage
+herdr usage --json
+herdr usage claude-statusline
+herdr usage cursor-login
+herdr usage cursor-login --browser Brave
+herdr usage cursor-login --paste
+herdr usage cursor-login --help
+herdr usage cursor-login --refresh
+herdr usage cursor-login --status
+herdr usage cursor-login --forget
+```
+
+Allowance readings run locally without a running server. The status line command reads Claude's JSON on stdin. On macOS, `cursor-login` asks once before reading browser cookies; `--refresh` never prompts. On macOS and Linux, `--paste` accepts a Cookie header at a hidden interactive prompt, checks it, and saves the login. Open your signed-in cursor.com page, open DevTools → Network, select a cursor.com request, and copy only its **Cookie header value**. Do not pass the value as an argument or a full cURL command. Input is limited to 16 KiB; piped input is rejected. `--help` includes these steps.
+
+Pasted logins cannot refresh themselves. On expiry, sign in and run `herdr usage cursor-login --paste` again. `--status` reports the source and storage state; `--forget` removes only Herdr's login and consent. Linux uses `secret-tool`/Secret Service; if unavailable, a separate `[y/N]` prompt offers a plaintext 0600 file in a 0700 state folder. Declining saves nothing. Locked or denied keyring access is an error. Linux automatic cookie import is deferred; bare `cursor-login` reports the default browser and points to `--paste`. Windows runtime is not supported by this build.
+
+Exit codes: 0 success or declined consent, 1 error, 3 missing consent or unsupported automatic import, 4 signed out or a pasted login needing another paste. Plain and JSON readings never import a login. See [configuration](./configuration/#pane-header) for usage settings.
+
 ## Server
 
 ```bash
@@ -98,6 +119,32 @@ herdr tab rename <tab_id> <label>
 herdr tab close <tab_id>
 ```
 
+## View
+
+```bash
+herdr view <part> [show|hide|toggle] [--workspace <workspace_id>] [--tab <tab_id>]
+```
+
+Folds a part of the interface away or shows it again. Without `show` or `hide`, the part is toggled. The parts:
+
+| Part | What folds | Takes |
+| --- | --- | --- |
+| `sidebar` | the whole sidebar, down to a narrow strip | nothing |
+| `spaces` | the sidebar's spaces section, down to its header and the space on screen | nothing |
+| `agent-table` | the agent table, down to its one-row header | nothing |
+| `agents` | the agent and pane rows under a space's card | `--workspace`, or the space on screen |
+| `group` | the worktree spaces under their repository's card | `--workspace`, or the space on screen |
+| `minimap` | the layout previews under tab names | `--tab`, or `--workspace` for its tabs, or every tab |
+| `usage` | the allowance meters in the agent table, the pane headers and the sidebar, together | nothing |
+
+When one call covers several minimaps, a toggle hides them all if any is shown and shows them all otherwise. A part that takes nothing refuses `--workspace` and `--tab`, and `group` refuses a space that heads no worktree group. Every fold is saved with the session, the same as when it is clicked.
+
+```bash
+herdr view minimap hide
+herdr view agents --workspace 2
+herdr view agent-table show
+```
+
 ## Panes
 
 ```bash
@@ -108,7 +155,7 @@ herdr pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-f
 herdr pane close <pane_id>
 ```
 
-`<pane_id>` accepts a pane ID from `pane list` or the pane's assigned name, case-insensitively. An agent with a session title is named from that title: a headline that ends in a past verb becomes an `-er`/`-or` agentive on the last two content nouns (`naming-convention-explainer`), an imperative title uses the first content verb and the last two content words of its object (`yellow-banner-hider`), a noun-only title becomes `-man` or `-ist` (`workman`, `machinist`), and anything else uses the first three words as a slug (`herdr-pane-title`). Collisions get `-2`. A shell, or an agent that has not been titled yet, still gets a first name from the word list (`Olivia`, `Olivia-2` on collision). Pane IDs compact when panes close; the name stays with its pane for the life of the terminal and survives restarts, so prefer names in anything longer-lived than one command. `pane list` and `pane get` return the name as a `name` field.
+`<pane_id>` accepts a pane ID from `pane list` or the pane's assigned name, case-insensitively. Assigned names come from a first-name word list hashed from the terminal id (`Olivia`, `Olivia-2` on collision). A manual rename still wins. Pane IDs compact when panes close; the name stays with its pane for the life of the terminal and survives restarts, so prefer names in anything longer-lived than one command. `pane list` and `pane get` return the name as a `name` field.
 
 Read output:
 

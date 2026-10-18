@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
-use crate::layout::{find_in_direction, NavDirection, PaneId};
+use crate::layout::{find_in_direction, DropZone, NavDirection, PaneId};
 use crate::selection::Selection;
 use crate::terminal::{EffectiveStateChange, TerminalStateMutation};
 use crate::workspace::WorkspaceGitStatus;
@@ -169,10 +169,13 @@ impl AppState {
             pane_id,
         };
         if previous.as_ref() == Some(&target) {
+            self.acknowledge_completion_on_focus(pane_id);
             return false;
         }
 
-        self.switch_workspace_tab(ws_idx, tab_idx);
+        // Selecting the tab is an intermediate step: only acknowledge the
+        // requested pane, not the pane that was focused in that tab before.
+        self.switch_workspace_tab_without_acknowledgement(ws_idx, tab_idx);
         if let Some(tab) = self
             .workspaces
             .get_mut(ws_idx)
@@ -180,6 +183,7 @@ impl AppState {
         {
             tab.layout.focus_pane(pane_id);
             self.previous_pane_focus = previous;
+            self.acknowledge_completion_on_focus(pane_id);
             self.mark_session_dirty();
             return true;
         }
@@ -820,11 +824,28 @@ impl AppState {
                 ws.switch_tab(active_tab);
             }
             self.record_pane_focus_after_navigation(previous_focus);
+            if let Some(target) = self.current_pane_focus_target() {
+                self.acknowledge_completion_on_focus(target.pane_id);
+            }
         }
     }
 
     /// Focus a space, and the pane the table row points at within it.
     pub(crate) fn switch_workspace_tab(&mut self, ws_idx: usize, tab_idx: usize) -> bool {
+        if !self.switch_workspace_tab_without_acknowledgement(ws_idx, tab_idx) {
+            return false;
+        }
+        if let Some(target) = self.current_pane_focus_target() {
+            self.acknowledge_completion_on_focus(target.pane_id);
+        }
+        true
+    }
+
+    fn switch_workspace_tab_without_acknowledgement(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+    ) -> bool {
         if ws_idx >= self.workspaces.len() {
             return false;
         }
@@ -853,6 +874,114 @@ impl AppState {
         }
         self.record_pane_focus_after_navigation(previous_focus);
         true
+    }
+
+    pub fn switch_tab(&mut self, idx: usize) {
+        if let Some(ws_idx) = self.active {
+            if self.switch_workspace_tab(ws_idx, idx) {
+                let workspace_id = self.workspaces[ws_idx].id.clone();
+                let tab_id = format!("{}:{}", workspace_id, idx + 1);
+                crate::logging::tab_focused(&workspace_id, &tab_id);
+            }
+            self.tab_scroll_follow_active = true;
+        }
+    }
+
+    pub fn move_tab(&mut self, source_idx: usize, insert_idx: usize) {
+        if let Some(ws) = self.active.and_then(|i| self.workspaces.get_mut(i)) {
+            if ws.move_tab(source_idx, insert_idx) {
+                self.mark_session_dirty();
+                self.tab_scroll_follow_active = true;
+            }
+        }
+    }
+
+    pub fn next_tab(&mut self) {
+        if let Some(ws) = self.active.and_then(|i| self.workspaces.get(i)) {
+            if !ws.tabs.is_empty() {
+                let next = (ws.active_tab + 1) % ws.tabs.len();
+                self.switch_tab(next);
+            }
+        }
+    }
+
+    pub fn previous_tab(&mut self) {
+        if let Some(ws) = self.active.and_then(|i| self.workspaces.get(i)) {
+            if !ws.tabs.is_empty() {
+                let prev = if ws.active_tab == 0 {
+                    ws.tabs.len() - 1
+                } else {
+                    ws.active_tab - 1
+                };
+                self.switch_tab(prev);
+            }
+        }
+    }
+
+    pub fn scroll_tabs_left(&mut self) {
+        if self.tab_scroll > 0 {
+            self.tab_scroll -= 1;
+            self.tab_scroll_follow_active = false;
+        }
+    }
+
+    pub fn scroll_tabs_right(&mut self) {
+        let max = self
+            .active
+            .and_then(|i| self.workspaces.get(i))
+            .map(|ws| ws.tabs.len().saturating_sub(1))
+            .unwrap_or(0);
+        if self.tab_scroll < max {
+            self.tab_scroll += 1;
+            self.tab_scroll_follow_active = false;
+        }
+    }
+
+    pub fn close_tab(&mut self) -> bool {
+        if self.active.is_some_and(|ws_idx| {
+            self.workspaces
+                .get(ws_idx)
+                .is_some_and(|ws| ws.tabs.len() <= 1)
+                && self.workspace_close_would_close_worktree_group(ws_idx)
+        }) {
+            if let Some(ws_idx) = self.active {
+                if self.confirm_implicit_worktree_group_close(ws_idx) {
+                    return true;
+                }
+            }
+        }
+
+        self.selection = None;
+        self.selection_autoscroll = None;
+        self.mark_session_dirty();
+        let should_close_workspace = self
+            .active
+            .and_then(|i| self.workspaces.get(i))
+            .is_some_and(|ws| ws.tabs.len() <= 1);
+        if should_close_workspace {
+            if let Some(active) = self.active {
+                self.selected = active;
+            }
+            self.close_selected_workspace();
+            return false;
+        }
+        if let Some(ws_idx) = self.active {
+            let terminal_ids = self
+                .workspaces
+                .get(ws_idx)
+                .map(|ws| self.terminal_ids_for_tab(ws_idx, ws.active_tab))
+                .unwrap_or_default();
+            let Some(ws) = self.workspaces.get_mut(ws_idx) else {
+                return false;
+            };
+            let workspace_id = ws.id.clone();
+            let closing_tab_id = format!("{}:{}", workspace_id, ws.active_tab + 1);
+            ws.close_active_tab();
+            self.remove_unattached_terminal_ids(terminal_ids);
+            crate::logging::tab_closed(&workspace_id, &closing_tab_id);
+            self.tab_scroll_follow_active = true;
+        }
+        false
     }
 
     /// Keep the space's agents on screen in the agent table. On mobile the
@@ -896,14 +1025,45 @@ impl AppState {
         self.outer_terminal_focus == Some(false)
     }
 
-    /// Take the done marker off one agent, which is the only thing that does.
-    ///
-    /// The marker answers "which agent finished while I was elsewhere", and an
-    /// answer that a stray click on a pane can erase is not an answer. So it
-    /// survives focus, tab switches and space switches, and comes off only when
-    /// the marker itself is clicked. The row keeps a check afterwards, so the
-    /// agent still reads as finished rather than as one that never ran.
-    pub(crate) fn acknowledge_agent_completion(&mut self, pane_id: PaneId) -> bool {
+    /// A focus action confirms a pending completion only when explicitly enabled.
+    /// This is idempotent: focusing an acknowledged pane never unchecks it.
+    fn acknowledge_completion_on_focus(&mut self, pane_id: PaneId) {
+        if !self.acknowledge_on_pane_focus {
+            return;
+        }
+        let pane = self
+            .workspaces
+            .iter_mut()
+            .flat_map(|ws| ws.tabs.iter_mut())
+            .find_map(|tab| tab.panes.get_mut(&pane_id))
+            .or_else(|| {
+                self.detached_agents
+                    .iter_mut()
+                    .find(|agent| agent.pane_id == pane_id)
+                    .map(|agent| &mut agent.pane)
+            });
+        let Some(pane) = pane else {
+            return;
+        };
+        if pane.seen
+            || !self
+                .terminals
+                .get(&pane.attached_terminal_id)
+                .is_some_and(|terminal| terminal.state == AgentState::Idle)
+        {
+            return;
+        }
+        pane.seen = true;
+        pane.completed = true;
+        self.mark_session_dirty();
+    }
+
+    /// Toggle the done marker on one agent: the dot becomes a check, the check
+    /// becomes a dot, without also jumping to the agent. Focus actions may
+    /// confirm it separately when enabled. A later run puts the dot back on
+    /// its own, so a check earned on the last task does not pretend this one
+    /// was looked at.
+    pub(crate) fn toggle_agent_completion_acknowledgement(&mut self, pane_id: PaneId) -> bool {
         let pane = self
             .workspaces
             .iter_mut()
@@ -918,10 +1078,11 @@ impl AppState {
         let Some(pane) = pane else {
             return false;
         };
-        if pane.seen {
+        if pane.seen && !pane.completed {
             return false;
         }
-        pane.seen = true;
+        pane.seen = !pane.seen;
+        pane.completed = true;
         self.mark_session_dirty();
         true
     }
@@ -937,7 +1098,9 @@ impl AppState {
             .into_iter()
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
-                crate::ui::WorkspaceListEntry::Agent { .. } => None,
+                crate::ui::WorkspaceListEntry::Tab { .. }
+                | crate::ui::WorkspaceListEntry::Agent { .. }
+                | crate::ui::WorkspaceListEntry::Pane { .. } => None,
             })
             .collect::<Vec<_>>();
         if order.is_empty() {
@@ -1154,6 +1317,36 @@ impl AppState {
         true
     }
 
+    /// A docked pane can fly out only when its tab still has another pane to
+    /// keep. A set-down agent can always become a space of its own.
+    pub(crate) fn can_fly_pane_to_new_workspace(&self, pane_id: crate::layout::PaneId) -> bool {
+        if self
+            .detached_agents
+            .iter()
+            .any(|detached| detached.pane_id == pane_id)
+        {
+            return !self.workspaces.is_empty();
+        }
+        self.workspaces.iter().any(|ws| {
+            ws.find_tab_index_for_pane(pane_id)
+                .and_then(|tab_idx| ws.tabs.get(tab_idx))
+                .is_some_and(|tab| !tab.zoomed && tab.layout.pane_count() > 1)
+        })
+    }
+
+    /// Fly a docked pane or a set-down agent out onto `+ new`.
+    pub fn fly_pane_to_new_workspace(&mut self, pane_id: crate::layout::PaneId) -> bool {
+        if self
+            .detached_agents
+            .iter()
+            .any(|detached| detached.pane_id == pane_id)
+        {
+            self.promote_detached_agent_to_new_workspace(pane_id)
+        } else {
+            self.promote_pane_to_new_workspace(pane_id)
+        }
+    }
+
     pub fn promote_pane_to_new_workspace(&mut self, source_pane_id: crate::layout::PaneId) -> bool {
         let Some(ws_idx) = self
             .workspaces
@@ -1186,6 +1379,64 @@ impl AppState {
             return false;
         };
 
+        self.clear_selection_if_pane(pane_id);
+        self.push_workspace_from_existing_pane(
+            pane_id,
+            pane_state,
+            identity_cwd,
+            events,
+            render_notify,
+            render_dirty,
+        );
+        true
+    }
+
+    fn promote_detached_agent_to_new_workspace(&mut self, pane_id: crate::layout::PaneId) -> bool {
+        let Some(position) = self
+            .detached_agents
+            .iter()
+            .position(|detached| detached.pane_id == pane_id)
+        else {
+            return false;
+        };
+        let Some(ws) = self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .or_else(|| self.workspaces.first())
+        else {
+            return false;
+        };
+        let Some(tab) = ws.active_tab().or_else(|| ws.tabs.first()) else {
+            return false;
+        };
+        let events = tab.events.clone();
+        let render_notify = tab.render_notify.clone();
+        let render_dirty = tab.render_dirty.clone();
+        let fallback_cwd = ws.identity_cwd.clone();
+
+        let detached = self.detached_agents.remove(position);
+        if self.agent_peek == Some(pane_id) {
+            self.agent_peek = None;
+        }
+        let identity_cwd = self
+            .terminals
+            .get(&detached.pane.attached_terminal_id)
+            .map(|terminal| terminal.cwd.clone())
+            .unwrap_or(fallback_cwd);
+
+        self.clear_selection_if_pane(detached.pane_id);
+        self.push_workspace_from_existing_pane(
+            detached.pane_id,
+            detached.pane,
+            identity_cwd,
+            events,
+            render_notify,
+            render_dirty,
+        );
+        true
+    }
+
+    fn clear_selection_if_pane(&mut self, pane_id: crate::layout::PaneId) {
         if self
             .selection
             .as_ref()
@@ -1194,7 +1445,17 @@ impl AppState {
             self.selection = None;
             self.selection_autoscroll = None;
         }
+    }
 
+    fn push_workspace_from_existing_pane(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        pane_state: crate::pane::PaneState,
+        identity_cwd: std::path::PathBuf,
+        events: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+        render_notify: std::sync::Arc<tokio::sync::Notify>,
+        render_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let workspace = crate::workspace::Workspace::from_existing_pane(
             pane_id,
             pane_state,
@@ -1210,7 +1471,93 @@ impl AppState {
         self.switch_workspace(new_idx);
         self.mode = Mode::Terminal;
         self.mark_session_dirty();
+    }
+
+    pub(crate) fn workspace_index_for_pane(&self, pane_id: PaneId) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .position(|ws| ws.find_tab_index_for_pane(pane_id).is_some())
+    }
+
+    /// Move a pane onto another. Same space: swap in the middle, or pin to an
+    /// edge. Different spaces: take it out of the source layout and dock it
+    /// into the destination. A middle drop across spaces splits the target to
+    /// the right rather than swapping, because the other pane would otherwise
+    /// vanish into a space the user is no longer looking at.
+    pub fn move_pane_to_pane(
+        &mut self,
+        source: PaneId,
+        target: PaneId,
+        zone: crate::layout::DropZone,
+    ) -> bool {
+        if source == target {
+            return false;
+        }
+        let Some(source_ws) = self.workspace_index_for_pane(source) else {
+            return false;
+        };
+        let Some(target_ws) = self.workspace_index_for_pane(target) else {
+            return false;
+        };
+        if source_ws == target_ws {
+            return match zone {
+                crate::layout::DropZone::Over => self.swap_panes(source, target),
+                crate::layout::DropZone::Edge(side) => self.pin_pane_to_edge(source, target, side),
+            };
+        }
+
+        let Some((pane_id, pane)) = self.workspaces[source_ws].take_pane(source) else {
+            return false;
+        };
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.pane_id == pane_id)
+        {
+            self.selection = None;
+            self.selection_autoscroll = None;
+        }
+
+        let side = match zone {
+            crate::layout::DropZone::Edge(side) => side,
+            crate::layout::DropZone::Over => crate::layout::SplitSide::Right,
+        };
+        if !self.workspaces[target_ws].dock_detached_at_edge(target, side, (pane_id, pane.clone()))
+        {
+            self.restore_stolen_pane(source_ws, pane_id, pane);
+            return false;
+        }
+        let mut dest_ws = target_ws;
+        if self.workspaces[source_ws].is_vacant() {
+            self.remove_vacant_workspace(source_ws);
+            if dest_ws > source_ws {
+                dest_ws -= 1;
+            }
+        }
+        self.focus_pane_in_workspace(dest_ws, pane_id);
+        self.mark_session_dirty();
         true
+    }
+
+    /// Drop a pane onto a space card: dock it beside that space's focused pane.
+    /// Dropping on the space the pane already belongs to leaves the layout
+    /// alone.
+    pub fn move_pane_into_workspace(&mut self, source: PaneId, ws_idx: usize) -> bool {
+        if self.workspace_index_for_pane(source) == Some(ws_idx) {
+            return false;
+        }
+        let Some(target) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+        else {
+            return false;
+        };
+        self.move_pane_to_pane(
+            source,
+            target,
+            crate::layout::DropZone::Edge(crate::layout::SplitSide::Right),
+        )
     }
 
     pub fn move_agent_to_index(&mut self, source_pane_id: PaneId, insert_idx: usize) -> bool {
@@ -1232,14 +1579,7 @@ impl AppState {
         if to == from {
             return false;
         }
-        let mut order: Vec<_> = entries
-            .iter()
-            .map(|entry| entry.terminal_id.clone())
-            .collect();
-        let moved = order.remove(from);
-        order.insert(to, moved);
-        self.agent_order = order;
-        self.mark_session_dirty();
+        crate::ui::move_listed_agent(self, from, to);
         true
     }
 
@@ -1268,6 +1608,7 @@ impl AppState {
 
         if self.active == Some(ws_idx) && self.workspaces[ws_idx].focused_pane_id() == Some(pane_id)
         {
+            self.acknowledge_completion_on_focus(pane_id);
             self.ensure_agent_panel_entry_visible(idx);
             return true;
         }
@@ -1280,17 +1621,12 @@ impl AppState {
     }
 
     fn cycle_agent_entry(&mut self, forward: bool) {
-        let entries = crate::ui::agent_panel_entries(self);
-        if entries.is_empty() {
-            return;
-        }
-
+        // Cycling walks every agent in a space, listed or not: hiding those
+        // rows from the table does not take their panes out of reach.
         // Set-down agents have no pane to land on, so cycling steps over them.
-        let docked: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.docked)
-            .map(|(idx, _)| idx)
+        let docked: Vec<_> = crate::ui::all_agent_panel_entries(self)
+            .into_iter()
+            .filter(|entry| entry.docked)
             .collect();
         if docked.is_empty() {
             return;
@@ -1299,11 +1635,8 @@ impl AppState {
             .active
             .and_then(|idx| self.workspaces.get(idx))
             .and_then(crate::workspace::Workspace::focused_pane_id);
-        let current_pos = focused.and_then(|pane_id| {
-            docked
-                .iter()
-                .position(|idx| entries[*idx].docked && entries[*idx].pane_id == pane_id)
-        });
+        let current_pos =
+            focused.and_then(|pane_id| docked.iter().position(|entry| entry.pane_id == pane_id));
         let target_pos = match (current_pos, forward) {
             (Some(pos), true) => (pos + 1) % docked.len(),
             (Some(0), false) => docked.len() - 1,
@@ -1312,7 +1645,18 @@ impl AppState {
             (None, false) => docked.len() - 1,
         };
 
-        self.focus_agent_entry(docked[target_pos]);
+        let target = &docked[target_pos];
+        let listed_idx = crate::ui::agent_panel_entries(self)
+            .iter()
+            .position(|entry| entry.pane_id == target.pane_id);
+        match listed_idx {
+            Some(idx) => {
+                self.focus_agent_entry(idx);
+            }
+            None => {
+                self.focus_pane_in_workspace(target.ws_idx, target.pane_id);
+            }
+        }
     }
 
     /// Bring an agent's row on screen. The table follows the focused agent
@@ -1645,6 +1989,45 @@ impl AppState {
         }
         self.mark_session_dirty();
     }
+
+    fn restore_stolen_pane(
+        &mut self,
+        ws_idx: usize,
+        pane_id: PaneId,
+        pane: crate::pane::PaneState,
+    ) {
+        if let Some(ws) = self.workspaces.get_mut(ws_idx) {
+            ws.restore_taken_pane(pane_id, pane);
+        }
+    }
+
+    fn remove_vacant_workspace(&mut self, ws_idx: usize) {
+        if ws_idx >= self.workspaces.len() || !self.workspaces[ws_idx].is_vacant() {
+            return;
+        }
+        if let Some(workspace_id) = self.workspaces.get(ws_idx).map(|ws| ws.id.clone()) {
+            crate::logging::workspace_closed(&workspace_id);
+        }
+        self.workspaces.remove(ws_idx);
+        if self.workspaces.is_empty() {
+            self.active = None;
+            self.selected = 0;
+            return;
+        }
+        if self.selected >= self.workspaces.len() {
+            self.selected = self.workspaces.len() - 1;
+        } else if ws_idx < self.selected {
+            self.selected -= 1;
+        }
+        if let Some(active) = self.active {
+            if active == ws_idx {
+                self.active = Some(self.selected);
+            } else if active > ws_idx {
+                self.active = Some(active - 1);
+            }
+        }
+        self.ensure_workspace_visible(self.selected);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1776,7 +2159,7 @@ impl AppState {
             return;
         }
 
-        self.switch_workspace_tab(ws_idx, tab_idx);
+        self.switch_workspace_tab_without_acknowledgement(ws_idx, tab_idx);
         if let Some(tab) = self
             .workspaces
             .get_mut(ws_idx)
@@ -1784,17 +2167,26 @@ impl AppState {
         {
             tab.layout.focus_pane(target.pane_id);
             self.previous_pane_focus = current;
+            self.acknowledge_completion_on_focus(target.pane_id);
             self.mark_session_dirty();
         }
     }
 
     pub fn toggle_pane_dimmed(&mut self, pane_id: PaneId) {
         if let Some(pane) = self
-            .active
-            .and_then(|i| self.workspaces.get_mut(i))
-            .and_then(|ws| ws.pane_state_mut(pane_id))
+            .workspaces
+            .iter_mut()
+            .find_map(|ws| ws.pane_state_mut(pane_id))
         {
             pane.dimmed = !pane.dimmed;
+            return;
+        }
+        if let Some(detached) = self
+            .detached_agents
+            .iter_mut()
+            .find(|detached| detached.pane_id == pane_id)
+        {
+            detached.pane.dimmed = !detached.pane.dimmed;
         }
     }
 
@@ -1803,11 +2195,8 @@ impl AppState {
     /// harnesses whose reset command herdr does not know, return `None` so the
     /// reset action stays hidden instead of typing a guess into the pane.
     pub(crate) fn agent_reset_command_for_pane(&self, pane_id: PaneId) -> Option<&'static str> {
-        let terminal_id = self
-            .workspaces
-            .iter()
-            .find_map(|ws| ws.terminal_id(pane_id))?;
-        let agent = self.terminals.get(terminal_id)?.effective_known_agent()?;
+        let terminal_id = self.terminal_id_for_any_pane(pane_id)?;
+        let agent = self.terminals.get(&terminal_id)?.effective_known_agent()?;
         crate::detect::agent_reset_command(agent)
     }
 
@@ -1827,15 +2216,7 @@ impl AppState {
         let Some(command) = self.agent_reset_command_for_pane(pane_id) else {
             return false;
         };
-        let Some(ws_idx) = self
-            .workspaces
-            .iter()
-            .position(|ws| ws.terminal_id(pane_id).is_some())
-        else {
-            return false;
-        };
-        let Some(runtime) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
-        else {
+        let Some(runtime) = self.runtime_for_agent_pane(terminal_runtimes, pane_id) else {
             return false;
         };
 
@@ -1926,9 +2307,7 @@ impl AppState {
     }
 
     pub fn toggle_zoom(&mut self) {
-        if self.agent_peek.take().is_some() {
-            return;
-        }
+        let _ = self.commit_peek_into_layout();
         if let Some(tab) = self
             .active
             .and_then(|i| self.workspaces.get_mut(i))
@@ -1990,11 +2369,38 @@ impl AppState {
     /// change. Calling this again for the same pane leaves the overlay in place.
     pub(crate) fn peek_agent(&mut self, pane_id: PaneId) {
         self.agent_peek = Some(pane_id);
+        self.acknowledge_completion_on_focus(pane_id);
         self.mode = Mode::Terminal;
     }
 
     pub(crate) fn clear_agent_peek(&mut self) {
         self.agent_peek = None;
+    }
+
+    /// Put the peeked overlay into the current space so pane actions apply to
+    /// it, not the layout underneath. A set-down agent takes the focused pane's
+    /// slot. If the peeked pane is already in a space, that space is focused.
+    pub(crate) fn commit_peek_into_layout(&mut self) -> bool {
+        let Some(peeked) = self.agent_peek else {
+            return false;
+        };
+        if let Some(ws_idx) = self.workspace_index_for_pane(peeked) {
+            self.agent_peek = None;
+            self.focus_pane_in_workspace(ws_idx, peeked);
+            return true;
+        }
+        let Some(target) = self
+            .active
+            .and_then(|idx| self.workspaces.get(idx))
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+        else {
+            return false;
+        };
+        if peeked == target {
+            self.agent_peek = None;
+            return true;
+        }
+        self.dock_detached_agent(peeked, target, DropZone::Over)
     }
 
     pub(crate) fn terminal_id_for_any_pane(
@@ -2111,12 +2517,12 @@ impl AppState {
         col: u16,
     ) -> bool {
         // Resolve the active pane cell the double-click landed on.
-        let Some(ws_idx) = self
+        if self
             .active
-            .filter(|idx| self.workspaces.get(*idx).is_some())
-        else {
+            .is_none_or(|idx| self.workspaces.get(idx).is_none())
+        {
             return false;
-        };
+        }
 
         let Some(info) = self.pane_info_by_id(pane_id) else {
             return false;
@@ -2126,8 +2532,7 @@ impl AppState {
         }
 
         // Leave mouse input to terminal apps that requested it.
-        let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
-        else {
+        let Some(rt) = self.runtime_for_agent_pane(terminal_runtimes, pane_id) else {
             return false;
         };
         if rt
@@ -2180,15 +2585,18 @@ impl AppState {
         viewport_row: u16,
         col: u16,
     ) -> Option<String> {
-        let ws_idx = self
+        if self
             .active
-            .filter(|idx| self.workspaces.get(*idx).is_some())?;
+            .is_none_or(|idx| self.workspaces.get(idx).is_none())
+        {
+            return None;
+        }
         let info = self.pane_info_by_id(pane_id)?;
         if viewport_row >= info.inner_rect.height || col >= info.inner_rect.width {
             return None;
         }
 
-        let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
+        let rt = self.runtime_for_agent_pane(terminal_runtimes, pane_id)?;
         let screen_col = info.inner_rect.x.saturating_add(col);
         let screen_row = info.inner_rect.y.saturating_add(viewport_row);
         if let Some((_, _, uri)) = rt
@@ -2220,13 +2628,15 @@ impl AppState {
             return;
         }
 
-        let ws_idx = match self.active {
-            Some(ws_idx) if self.workspaces.get(ws_idx).is_some() => ws_idx,
-            _ => return,
-        };
+        if self
+            .active
+            .is_none_or(|idx| self.workspaces.get(idx).is_none())
+        {
+            return;
+        }
 
         let text = self
-            .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
+            .runtime_for_agent_pane(terminal_runtimes, sel.pane_id)
             .and_then(|rt| rt.extract_selection(&sel));
         if let Some(text) = text {
             if !text.is_empty() {
@@ -2737,24 +3147,21 @@ impl AppState {
                 ttl,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    let mutation =
-                        terminal.set_agent_metadata(crate::terminal::AgentMetadataReport {
-                            source,
-                            agent_label,
-                            applies_to_source,
-                            title,
-                            display_agent,
-                            custom_status,
-                            state_labels,
-                            clear_title,
-                            clear_display_agent,
-                            clear_custom_status,
-                            clear_state_labels,
-                            ttl,
-                            seq,
-                        });
-                    terminal.freeze_title_name();
-                    mutation
+                    terminal.set_agent_metadata(crate::terminal::AgentMetadataReport {
+                        source,
+                        agent_label,
+                        applies_to_source,
+                        title,
+                        display_agent,
+                        custom_status,
+                        state_labels,
+                        clear_title,
+                        clear_display_agent,
+                        clear_custom_status,
+                        clear_state_labels,
+                        ttl,
+                        seq,
+                    })
                 })
                 .into_iter()
                 .collect(),
@@ -2788,6 +3195,7 @@ impl AppState {
             // Intercepted in App::handle_internal_event before reaching this
             // dispatch; never touches AppState.
             AppEvent::ClipboardWrite { .. } => Vec::new(),
+            AppEvent::OscTitleChanged { .. } => Vec::new(),
             AppEvent::GitStatusRefreshed {
                 results,
                 cache_updates,
@@ -2796,7 +3204,12 @@ impl AppState {
                 let _ = cache_updates;
                 Vec::new()
             }
+            AppEvent::UsageRefreshed { .. } => Vec::new(),
             AppEvent::AgentModelRefreshed { .. } => Vec::new(),
+            AppEvent::SummaryRefreshed { .. } => Vec::new(),
+            AppEvent::CommanderRead { .. } => Vec::new(),
+            AppEvent::CommanderSplit { .. } => Vec::new(),
+            AppEvent::CommanderOrdered { .. } => Vec::new(),
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::WorktreeLandFinished(_) => Vec::new(),
@@ -2925,7 +3338,7 @@ impl AppState {
             pane.seen = true;
             pane.completed = false;
         } else if is_background_completion_transition(change.previous_state, change.state) {
-            pane.seen = suppress_active_tab_notifications;
+            pane.seen = false;
             pane.completed = true;
         }
         let seen = pane.seen;
@@ -3963,7 +4376,7 @@ mod tests {
             },
         );
 
-        state.sort_agent_table_by_column(2);
+        state.sort_agent_table_by_column(1);
 
         assert_eq!(pane_table_order(&state), vec![apple, mango, zebra]);
     }
@@ -3987,7 +4400,7 @@ mod tests {
         terminal_for(&mut state, first).session_title = Some("Add docs".into());
         terminal_for(&mut state, middle).session_title = Some("Fix parser".into());
 
-        state.sort_agent_table_by_column(1);
+        state.sort_agent_table_by_column(2);
 
         assert_eq!(pane_table_order(&state), vec![first, middle, later]);
     }
@@ -4138,6 +4551,131 @@ mod tests {
         assert_eq!(state.workspaces[1].focused_pane_id(), Some(second_tab_root));
         assert_ne!(second_first_root, second_tab_root);
     }
+
+    fn pending_focus_state() -> (AppState, PaneId, PaneId) {
+        let mut state = app_with_workspaces(&["source", "destination"]);
+        let first = state.workspaces[1].tabs[0].root_pane;
+        let second = state.workspaces[1].test_split(Direction::Horizontal);
+        state.workspaces[1].tabs[0].layout.focus_pane(first);
+        state.ensure_test_terminals();
+        for pane_id in [first, second] {
+            let pane = state.workspaces[1].pane_state_mut(pane_id).unwrap();
+            pane.seen = false;
+            pane.completed = true;
+            let terminal_id = pane.attached_terminal_id.clone();
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_detected_state(Some(Agent::Codex), AgentState::Idle);
+        }
+        (state, first, second)
+    }
+
+    #[test]
+    fn acknowledge_on_focus_is_opt_in() {
+        let (mut state, first, second) = pending_focus_state();
+        assert!(state.focus_pane_in_workspace(1, second));
+        assert!(!state.workspaces[1].pane_state(first).unwrap().seen);
+        assert!(!state.workspaces[1].pane_state(second).unwrap().seen);
+    }
+
+    #[test]
+    fn acknowledge_on_focus_only_confirms_the_final_target_and_is_idempotent() {
+        let (mut state, first, second) = pending_focus_state();
+        state.acknowledge_on_pane_focus = true;
+        assert!(state.focus_pane_in_workspace(1, second));
+        assert!(!state.workspaces[1].pane_state(first).unwrap().seen);
+        assert!(state.workspaces[1].pane_state(second).unwrap().seen);
+        assert!(state.workspaces[1].pane_state(second).unwrap().completed);
+        assert!(!state.focus_pane_in_workspace(1, second));
+        assert!(state.workspaces[1].pane_state(second).unwrap().seen);
+        // A new completion on the already focused pane needs another focus action.
+        state.workspaces[1].pane_state_mut(second).unwrap().seen = false;
+        assert!(!state.focus_pane_in_workspace(1, second));
+        assert!(state.workspaces[1].pane_state(second).unwrap().seen);
+        assert!(!state.workspaces[1].pane_state(first).unwrap().seen);
+    }
+
+    #[test]
+    fn acknowledge_on_focus_tab_and_space_navigation_only_confirm_the_focused_pane() {
+        for by_space in [false, true] {
+            let (mut state, first, second) = pending_focus_state();
+            state.acknowledge_on_pane_focus = true;
+            if by_space {
+                state.switch_workspace(1);
+            } else {
+                assert!(state.switch_workspace_tab(1, 0));
+            }
+            assert!(state.workspaces[1].pane_state(first).unwrap().seen);
+            assert!(!state.workspaces[1].pane_state(second).unwrap().seen);
+        }
+    }
+
+    #[test]
+    fn acknowledge_on_focus_ignores_working_blocked_and_invalid_targets() {
+        for status in [
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Unknown,
+        ] {
+            let (mut state, first, second) = pending_focus_state();
+            state.acknowledge_on_pane_focus = true;
+            let id = state.workspaces[1]
+                .pane_state(second)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            state.terminals.get_mut(&id).unwrap().state = status;
+            assert!(!state.focus_pane_in_workspace(99, second));
+            assert!(state.focus_pane_in_workspace(1, second));
+            assert!(!state.workspaces[1].pane_state(second).unwrap().seen);
+            assert!(!state.workspaces[1].pane_state(first).unwrap().seen);
+        }
+    }
+
+    #[test]
+    fn acknowledge_on_focus_keyboard_cycle_and_last_pane_confirm_the_target() {
+        let (mut state, first, second) = pending_focus_state();
+        state.switch_workspace(1);
+        state.acknowledge_on_pane_focus = true;
+        state.cycle_pane(false);
+        assert_eq!(state.workspaces[1].focused_pane_id(), Some(second));
+        assert!(state.workspaces[1].pane_state(second).unwrap().seen);
+        assert!(!state.workspaces[1].pane_state(first).unwrap().seen);
+        state.last_pane();
+        assert_eq!(state.workspaces[1].focused_pane_id(), Some(first));
+        assert!(state.workspaces[1].pane_state(first).unwrap().seen);
+    }
+
+    #[test]
+    fn acknowledge_on_focus_confirms_a_peeked_agent() {
+        let (mut state, first, second) = pending_focus_state();
+        state.set_down_agent_panes_in_tab(1, 0);
+        // Closing the space leaves these panes only in the detached registry.
+        state.workspaces.pop();
+        state.acknowledge_on_pane_focus = true;
+        state.peek_agent(second);
+        assert!(
+            state
+                .detached_agents
+                .iter()
+                .find(|agent| agent.pane_id == second)
+                .unwrap()
+                .pane
+                .seen
+        );
+        assert!(
+            !state
+                .detached_agents
+                .iter()
+                .find(|agent| agent.pane_id == first)
+                .unwrap()
+                .pane
+                .seen
+        );
+    }
+
     #[test]
     fn switch_workspace_leaves_the_done_marker_standing() {
         let mut state = app_with_workspaces(&["a", "b"]);
@@ -4153,13 +4691,37 @@ mod tests {
         let mut state = app_with_workspaces(&["a", "b"]);
         let id = *state.workspaces[1].panes.keys().next().unwrap();
         let other = *state.workspaces[0].panes.keys().next().unwrap();
-        state.workspaces[1].panes.get_mut(&id).unwrap().seen = false;
-        state.workspaces[0].panes.get_mut(&other).unwrap().seen = false;
+        {
+            let pane = state.workspaces[1].panes.get_mut(&id).unwrap();
+            pane.seen = false;
+            pane.completed = true;
+        }
+        {
+            let pane = state.workspaces[0].panes.get_mut(&other).unwrap();
+            pane.seen = false;
+            pane.completed = true;
+        }
 
-        assert!(state.acknowledge_agent_completion(id));
+        assert!(state.toggle_agent_completion_acknowledgement(id));
         assert!(state.workspaces[1].panes.get(&id).unwrap().seen);
         assert!(!state.workspaces[0].panes.get(&other).unwrap().seen);
-        assert!(!state.acknowledge_agent_completion(id));
+        assert!(state.toggle_agent_completion_acknowledgement(id));
+        assert!(!state.workspaces[1].panes.get(&id).unwrap().seen);
+        assert!(state.workspaces[1].panes.get(&id).unwrap().completed);
+        assert!(state.toggle_agent_completion_acknowledgement(id));
+        assert!(state.workspaces[1].panes.get(&id).unwrap().seen);
+    }
+
+    #[test]
+    fn clicking_an_agent_that_never_finished_does_not_invent_a_marker() {
+        let mut state = app_with_workspaces(&["a"]);
+        let id = *state.workspaces[0].panes.keys().next().unwrap();
+        assert!(state.workspaces[0].panes.get(&id).unwrap().seen);
+        assert!(!state.workspaces[0].panes.get(&id).unwrap().completed);
+
+        assert!(!state.toggle_agent_completion_acknowledgement(id));
+        assert!(state.workspaces[0].panes.get(&id).unwrap().seen);
+        assert!(!state.workspaces[0].panes.get(&id).unwrap().completed);
     }
 
     #[test]
@@ -4430,6 +4992,56 @@ mod tests {
     }
 
     #[test]
+    fn a_later_run_on_the_active_tab_finishes_with_the_done_dot() {
+        let mut state = app_with_workspaces(&["active"]);
+        state.active = Some(0);
+        state.outer_terminal_focus = Some(true);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        {
+            let pane = state.workspaces[0].panes.get_mut(&pane_id).unwrap();
+            pane.seen = true;
+            pane.completed = true;
+        }
+        state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Idle;
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        {
+            let pane = state.workspaces[0].panes.get(&pane_id).unwrap();
+            assert!(pane.seen);
+            assert!(!pane.completed);
+        }
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let pane = state.workspaces[0].panes.get(&pane_id).unwrap();
+        assert!(!pane.seen);
+        assert!(pane.completed);
+    }
+
+    #[test]
     fn state_changed_idle_in_background_marks_unseen() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
@@ -4461,7 +5073,7 @@ mod tests {
     }
 
     #[test]
-    fn active_tab_completion_marks_pane_seen() {
+    fn active_tab_completion_shows_the_done_dot() {
         let mut state = app_with_workspaces(&["active"]);
         state.active = Some(0);
         state.outer_terminal_focus = Some(true);
@@ -4473,7 +5085,11 @@ mod tests {
             .attached_terminal_id
             .clone();
         state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Working;
-        state.workspaces[0].panes.get_mut(&pane_id).unwrap().seen = false;
+        {
+            let pane = state.workspaces[0].panes.get_mut(&pane_id).unwrap();
+            pane.seen = true;
+            pane.completed = false;
+        }
 
         state.handle_app_event(AppEvent::StateChanged {
             pane_id,
@@ -4489,7 +5105,8 @@ mod tests {
         let terminal = state.terminals.get(&terminal_id).unwrap();
         assert_eq!(terminal.state, AgentState::Idle);
         let pane = state.workspaces[0].panes.get(&pane_id).unwrap();
-        assert!(pane.seen);
+        assert!(!pane.seen);
+        assert!(pane.completed);
     }
 
     #[test]
@@ -5124,8 +5741,8 @@ mod tests {
         state.peek_agent(pane_id);
         state.toggle_zoom();
         assert_eq!(state.agent_peek, None);
-        assert!(!state.workspaces[0].zoomed);
-        assert!(state.workspaces[0].pane_state(target).is_some());
+        assert!(state.workspaces[0].pane_state(pane_id).is_some());
+        assert!(state.workspaces[0].pane_state(target).is_none());
     }
 
     #[test]
@@ -5263,6 +5880,74 @@ mod tests {
         assert_eq!(state.detached_agents.len(), 1);
         assert_eq!(state.detached_agents[0].pane_id, target);
         assert!(state.terminals.contains_key(&displaced_terminal));
+    }
+
+    #[test]
+    fn moving_a_pane_into_another_workspace_docks_it_there() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        let source = state.workspaces[0].tabs[0].root_pane;
+        let sibling = state.workspaces[0].test_split(Direction::Horizontal);
+        let dest = state.workspaces[1].tabs[0].root_pane;
+        state.ensure_test_terminals();
+
+        assert!(state.move_pane_to_pane(
+            source,
+            dest,
+            crate::layout::DropZone::Edge(crate::layout::SplitSide::Right),
+        ));
+
+        assert!(state.workspaces[0].pane_state(source).is_none());
+        assert!(state.workspaces[0].pane_state(sibling).is_some());
+        assert!(state.workspaces[1].pane_state(source).is_some());
+        assert!(state.workspaces[1].pane_state(dest).is_some());
+        assert_eq!(state.active, Some(1));
+        assert_eq!(state.workspaces[1].focused_pane_id(), Some(source));
+    }
+
+    #[test]
+    fn dropping_a_pane_on_a_space_docks_beside_that_space_focus() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        let source = state.workspaces[0].tabs[0].root_pane;
+        let _sibling = state.workspaces[0].test_split(Direction::Horizontal);
+        let dest = state.workspaces[1].tabs[0].root_pane;
+        state.ensure_test_terminals();
+
+        assert!(state.move_pane_into_workspace(source, 1));
+
+        assert!(state.workspaces[0].pane_state(source).is_none());
+        assert!(state.workspaces[1].pane_state(source).is_some());
+        assert!(state.workspaces[1].pane_state(dest).is_some());
+        assert_eq!(state.workspaces[1].tabs[0].layout.pane_count(), 2);
+    }
+
+    #[test]
+    fn dropping_a_pane_on_its_own_space_leaves_the_layout() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        let source = state.workspaces[0].tabs[0].root_pane;
+        let sibling = state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+
+        assert!(!state.move_pane_into_workspace(source, 0));
+        assert!(state.workspaces[0].pane_state(source).is_some());
+        assert!(state.workspaces[0].pane_state(sibling).is_some());
+        assert_eq!(state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert!(state.workspaces[1].pane_state(source).is_none());
+    }
+
+    #[test]
+    fn moving_the_only_pane_into_another_space_closes_the_empty_one() {
+        let mut state = app_with_workspaces(&["one", "two"]);
+        let source = state.workspaces[0].tabs[0].root_pane;
+        let dest = state.workspaces[1].tabs[0].root_pane;
+        state.ensure_test_terminals();
+
+        assert!(state.move_pane_into_workspace(source, 1));
+
+        assert_eq!(state.workspaces.len(), 1);
+        assert!(state.workspaces[0].pane_state(source).is_some());
+        assert!(state.workspaces[0].pane_state(dest).is_some());
+        assert_eq!(state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert_eq!(state.active, Some(0));
     }
 
     #[test]
