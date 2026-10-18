@@ -760,6 +760,7 @@ mod tests {
     }
 
     fn band_state() -> AppState {
+        crate::harness::stand_in_claude_code();
         let mut app = AppState::test_new();
         app.mode = Mode::Composer;
         app.composer
