@@ -871,11 +871,15 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
+        // macOS reaches the temp directory through a symlink, so `pwd` can
+        // print the resolved path; compare the folders, not their spellings.
         assert_eq!(
-            std::fs::read_to_string(&proof)
-                .expect("the command should write its working directory")
-                .trim(),
-            cwd.to_string_lossy()
+            crate::worktree::canonical_or_original(std::path::Path::new(
+                std::fs::read_to_string(&proof)
+                    .expect("the command should write its working directory")
+                    .trim()
+            )),
+            crate::worktree::canonical_or_original(&cwd)
         );
         let terminal_id = app.state.detached_agents[0]
             .pane
@@ -1139,7 +1143,7 @@ mod tests {
         let workspaces_before = app.state.workspaces.len();
         app.submit_composer(crate::composer::Pending {
             cwd: checkout.clone(),
-            harness: crate::harness::named("Claude Code").unwrap(),
+            harness: claude_code(),
             task: "run the tests".into(),
             worktree: true,
         });
@@ -1177,7 +1181,7 @@ mod tests {
         let mut app = test_app();
         app.submit_composer(crate::composer::Pending {
             cwd: repo.clone(),
-            harness: crate::harness::named("Claude Code").unwrap(),
+            harness: claude_code(),
             task: "run the tests".into(),
             worktree: false,
         });
@@ -1206,7 +1210,7 @@ mod tests {
         let mut app = test_app();
         app.submit_composer(crate::composer::Pending {
             cwd: repo.clone(),
-            harness: crate::harness::named("Claude Code").unwrap(),
+            harness: claude_code(),
             task: "run the tests".into(),
             worktree: true,
         });
@@ -1231,6 +1235,31 @@ mod tests {
             started_cwd,
             Some(crate::worktree::canonical_or_original(&created[0].path))
         );
+    }
+
+    /// The Claude Code harness, with a stand-in `claude` on `PATH`.
+    ///
+    /// The composer tests start a real process, and a machine without Claude
+    /// Code installed, such as CI, would fail to start it. The stand-in only
+    /// waits, which is all these tests ask of an agent. It goes first on the
+    /// path once per test process.
+    fn claude_code() -> &'static crate::harness::Harness {
+        static STAND_IN: std::sync::Once = std::sync::Once::new();
+        STAND_IN.call_once(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let bin =
+                std::env::temp_dir().join(format!("herdr-test-claude-{}", std::process::id()));
+            std::fs::create_dir_all(&bin).unwrap();
+            let claude = bin.join("claude");
+            std::fs::write(&claude, "#!/bin/sh\nexec sleep 60\n").unwrap();
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let joined =
+                std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+                    .unwrap();
+            std::env::set_var("PATH", joined);
+        });
+        crate::harness::named("Claude Code").unwrap()
     }
 
     fn started_agent_cwd(app: &App) -> Option<std::path::PathBuf> {
@@ -1262,7 +1291,7 @@ mod tests {
 
         app.submit_composer(crate::composer::Pending {
             cwd: repo.clone(),
-            harness: crate::harness::named("Claude Code").unwrap(),
+            harness: claude_code(),
             task: "run the tests".into(),
             worktree: true,
         });
@@ -1323,7 +1352,7 @@ mod tests {
 
         app.submit_composer(crate::composer::Pending {
             cwd: repo.clone(),
-            harness: crate::harness::named("Claude Code").unwrap(),
+            harness: claude_code(),
             task: "run the tests".into(),
             worktree: false,
         });
