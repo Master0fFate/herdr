@@ -949,7 +949,10 @@ mod tests {
 
     #[test]
     fn a_path_being_typed_shows_the_untyped_letters_of_the_best_match() {
-        let root = std::env::temp_dir().join(format!(
+        // Under /tmp rather than the temp dir: macOS puts that deep under
+        // /private/var/folders, and a path wider than the field scrolls its
+        // start out of view.
+        let root = std::path::Path::new("/tmp").join(format!(
             "composer-ghost-draw-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -999,7 +1002,7 @@ mod tests {
 
     #[test]
     fn a_folder_an_agent_was_started_in_is_starred_at_the_head_of_the_list() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::path::Path::new("/tmp").join(format!(
             "herdr-composer-used-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1032,7 +1035,7 @@ mod tests {
 
     #[test]
     fn a_path_being_typed_lists_what_it_could_mean_under_it() {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::path::Path::new("/tmp").join(format!(
             "herdr-composer-draw-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -1080,7 +1083,7 @@ mod tests {
     }
 
     fn many_matching_folders(name: &str, count: usize) -> (std::path::PathBuf, AppState) {
-        let root = std::env::temp_dir().join(format!(
+        let root = std::path::Path::new("/tmp").join(format!(
             "composer-match-window-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
